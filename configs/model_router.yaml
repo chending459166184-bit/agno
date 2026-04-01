@@ -1,0 +1,59 @@
+default_task_type: general
+
+aliases:
+  coder-premium:
+    description: ChatGPT Subscription / Codex via local adapter
+    supports_tools: false
+    provider_kind: codex_subscription
+  coder-api:
+    description: OpenAI API key via LiteLLM Proxy
+    supports_tools: true
+    provider_kind: openai
+  minimax-general:
+    description: MiniMax via LiteLLM Proxy
+    supports_tools: true
+    provider_kind: minimax
+  glm-coder:
+    description: Z.AI / GLM coding endpoint via LiteLLM Proxy
+    supports_tools: true
+    provider_kind: zai
+
+task_routes:
+  orchestrate:
+    aliases:
+      - coder-premium
+      - coder-api
+      - glm-coder
+      - minimax-general
+  knowledge:
+    aliases:
+      - minimax-general
+      - glm-coder
+      - coder-api
+      - coder-premium
+    requires_tools: true
+  workspace:
+    aliases:
+      - glm-coder
+      - coder-api
+      - minimax-general
+      - coder-premium
+    requires_tools: true
+  testing:
+    aliases:
+      - coder-premium
+      - coder-api
+      - glm-coder
+      - minimax-general
+  external_broker:
+    aliases:
+      - coder-premium
+      - coder-api
+      - glm-coder
+      - minimax-general
+  general:
+    aliases:
+      - coder-api
+      - coder-premium
+      - minimax-general
+      - glm-coder

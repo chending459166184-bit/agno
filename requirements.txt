@@ -1,0 +1,14 @@
+agno==2.5.12
+fastapi==0.135.2
+uvicorn==0.42.0
+litellm==1.74.9
+apscheduler==3.11.2
+backoff==2.2.1
+orjson==3.11.4
+mcp==1.26.0
+openai==2.30.0
+pydantic==2.12.5
+pydantic-settings==2.13.1
+PyJWT==2.12.1
+SQLAlchemy==2.0.48
+PyYAML==6.0.3

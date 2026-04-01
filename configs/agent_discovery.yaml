@@ -1,0 +1,24 @@
+refresh_ttl_seconds: 60
+
+filters:
+  include_categories: []
+  exclude_categories: []
+  include_tags: []
+  exclude_tags: []
+
+default_a2a:
+  timeout_seconds: 20
+  auth_strategy: none
+  auth_header_name: Authorization
+  auth_token_env:
+
+sources:
+  - source_id: local-demo-catalog
+    transport: stdio
+    server_module: app.mcp.external_agent_catalog_server
+    tool_name: external_agent_catalog_list
+    get_tool_name: external_agent_catalog_get
+    timeout_seconds: 12
+    env:
+      EXTERNAL_AGENT_CATALOG_FILE: os.environ/EXTERNAL_AGENT_CATALOG_FILE
+      EXTERNAL_AGENT_BASE_URL: os.environ/EXTERNAL_AGENT_BASE_URL
