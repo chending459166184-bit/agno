@@ -53,9 +53,24 @@ class Settings(BaseSettings):
     external_agent_base_url: str = "http://127.0.0.1:7777"
     skills_root: Path = Field(default=Path("skills"))
     codex_safe_cwd_root: Path = Field(default=Path("data/codex_sandbox"))
+    exec_sandbox_enabled: bool = True
+    exec_sandbox_mode: str = "docker"
+    exec_jobs_root: Path = Field(default=Path("data/exec_jobs"))
+    exec_default_timeout_seconds: int = 30
+    exec_max_timeout_seconds: int = 120
+    exec_default_memory_mb: int = 512
+    exec_max_memory_mb: int = 1024
+    exec_default_cpu_limit: float = 1.0
+    exec_allow_network: bool = False
+    exec_allow_workspace_writeback: bool = False
+    exec_max_stdout_chars: int = 20000
+    exec_max_stderr_chars: int = 20000
+    exec_container_image: str = "python:3.11-slim"
     external_prefetch_enabled: bool = True
     external_prefetch_mode: str = "prefetch"
     mcp_allow_write: bool = True
+    workspace_guard_enabled: bool = False
+    execution_guard_enabled: bool = False
 
     allow_mock_fallback: bool = True
     telemetry_enabled: bool = False
@@ -116,6 +131,10 @@ class Settings(BaseSettings):
     @property
     def resolved_codex_safe_cwd_root(self) -> Path:
         return (self.project_root / self.codex_safe_cwd_root).resolve()
+
+    @property
+    def resolved_exec_jobs_root(self) -> Path:
+        return (self.project_root / self.exec_jobs_root).resolve()
 
     @property
     def codex_bridge_project_ids_list(self) -> list[str]:

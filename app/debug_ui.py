@@ -192,6 +192,7 @@ def render_debug_page() -> str:
             <button class="tab active" data-tab="chat">Chat</button>
             <button class="tab" data-tab="knowledge">Knowledge</button>
             <button class="tab" data-tab="workspace">Workspace</button>
+            <button class="tab" data-tab="execution">Execution</button>
             <button class="tab" data-tab="external">External</button>
             <button class="tab" data-tab="agents">Agents</button>
             <button class="tab" data-tab="trace">Trace</button>
@@ -259,6 +260,66 @@ def render_debug_page() -> str:
             </div>
           </section>
 
+          <section class="tab-panel" data-panel="execution">
+            <div class="stack">
+              <div class="summary-grid">
+                <div class="status-line mini">Execution tab 走的是独立 sandbox，不是普通 chat 环境。</div>
+                <div class="status-line mini">默认禁网，默认不写回 workspace，执行目录来自当前用户 workspace 的 staged 副本。</div>
+              </div>
+              <div class="row3">
+                <div>
+                  <label for="executionLanguage">language</label>
+                  <select id="executionLanguage">
+                    <option value="python" selected>python</option>
+                  </select>
+                </div>
+                <div>
+                  <label for="executionTimeout">timeout_seconds</label>
+                  <input id="executionTimeout" type="number" min="1" value="20" />
+                </div>
+                <div>
+                  <label for="executionWriteback">writeback</label>
+                  <select id="executionWriteback">
+                    <option value="false" selected>false</option>
+                    <option value="true">true</option>
+                  </select>
+                </div>
+              </div>
+              <div class="row2">
+                <div>
+                  <label for="executionCommand">command</label>
+                  <input id="executionCommand" value="python inline_task.py" />
+                </div>
+                <div>
+                  <label for="executionEntrypoint">entrypoint</label>
+                  <input id="executionEntrypoint" placeholder="例如 notes/script.py，可留空" />
+                </div>
+              </div>
+              <div>
+                <label for="executionScript">script content</label>
+                <textarea id="executionScript">print("hello from sandbox")</textarea>
+              </div>
+              <div class="row2">
+                <div>
+                  <label for="executionJobId">job_id</label>
+                  <input id="executionJobId" placeholder="执行后会自动填充最近一次 job_id" />
+                </div>
+                <div class="status-line mini">
+                  当前显示的是用户可控的 sandbox 执行结果：状态、stdout/stderr、产物和 trace。
+                </div>
+              </div>
+              <div class="actions">
+                <button id="executionRunBtn" type="button">执行到 Sandbox</button>
+                <button id="executionStatusBtn" type="button" class="secondary">查看 Job 状态</button>
+                <button id="executionLogsBtn" type="button" class="secondary">查看完整日志</button>
+                <button id="executionArtifactsBtn" type="button" class="secondary">查看产物列表</button>
+              </div>
+              <div class="result"><pre id="executionOutput">等待请求...</pre></div>
+              <div class="result"><pre id="executionLogsOutput">等待日志...</pre></div>
+              <div class="result"><pre id="executionArtifactsOutput">等待产物...</pre></div>
+            </div>
+          </section>
+
           <section class="tab-panel" data-panel="external">
             <div class="stack">
               <div class="row2">
@@ -317,6 +378,7 @@ def render_debug_page() -> str:
         users: [],
         currentProjects: [],
         lastTraceId: "",
+        lastExecutionJobId: "",
         aliases: [],
       };
 
@@ -356,6 +418,11 @@ def render_debug_page() -> str:
         state.lastTraceId = traceId || "";
         $("traceIdInput").value = state.lastTraceId;
         setBadge("traceBadge", state.lastTraceId ? `最近 trace: ${state.lastTraceId}` : "最近 trace: 无");
+      }
+
+      function updateExecutionJob(jobId) {
+        state.lastExecutionJobId = jobId || "";
+        if (jobId) $("executionJobId").value = jobId;
       }
 
       function renderProjectOptions(user) {
@@ -428,11 +495,12 @@ def render_debug_page() -> str:
         const data = await res.json();
         state.aliases = (data.aliases || []).map((item) => item.alias);
         const healthy = (data.healthy_aliases || []).join(", ") || "无";
+        const exec = data.execution || {};
         setBadge(
           "runtimeBadge",
           data.live
-            ? `live | healthy=${healthy} | external=${data.external_agents?.count ?? 0} | prefetch=${data.external_prefetch?.mode}`
-            : `mock | ${data.reason}`
+            ? `live | healthy=${healthy} | external=${data.external_agents?.count ?? 0} | exec=${exec.configured_mode || "n/a"} | prefetch=${data.external_prefetch?.mode}`
+            : `mock | ${data.reason} | exec=${exec.configured_mode || "n/a"}`
         );
       }
 
@@ -654,6 +722,83 @@ def render_debug_page() -> str:
         });
       }
 
+      function currentExecutionJobId() {
+        return $("executionJobId").value || state.lastExecutionJobId;
+      }
+
+      function buildExecutionPayload() {
+        const script = $("executionScript").value.trim();
+        const entrypoint = $("executionEntrypoint").value.trim();
+        const command = $("executionCommand").value.trim();
+        return {
+          project_id: selectedProject(),
+          language: $("executionLanguage").value,
+          command: command || null,
+          entrypoint: entrypoint || null,
+          files: script ? [{ path: entrypoint || "inline_task.py", content: script }] : [],
+          timeout_seconds: Number($("executionTimeout").value || 20),
+          writeback: $("executionWriteback").value === "true",
+        };
+      }
+
+      async function runExecution() {
+        return runAction({
+          ids: ["executionRunBtn", "executionStatusBtn", "executionLogsBtn", "executionArtifactsBtn"],
+          outputId: "executionOutput",
+          loadingText: "正在提交 sandbox 执行任务...",
+          fn: async () => parseJson(await authorizedFetch("/gateway/exec/run", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(buildExecutionPayload()),
+          })),
+          onDone: async (data) => {
+            updateExecutionJob(data.job?.job_id || "");
+            setOutput("executionLogsOutput", {
+              stdout: data.stdout,
+              stderr: data.stderr,
+              stdout_truncated: data.stdout_truncated,
+              stderr_truncated: data.stderr_truncated,
+            });
+            setOutput("executionArtifactsOutput", data.artifacts || []);
+            if (data.trace_id) await loadTraceSummary(data.trace_id, false);
+          },
+        });
+      }
+
+      async function loadExecutionStatus() {
+        const jobId = currentExecutionJobId();
+        if (!jobId) throw new Error("当前没有可用 execution job_id");
+        return runAction({
+          ids: ["executionRunBtn", "executionStatusBtn", "executionLogsBtn", "executionArtifactsBtn"],
+          outputId: "executionOutput",
+          loadingText: "正在加载 execution job 状态...",
+          fn: async () => parseJson(await authorizedFetch(`/gateway/exec/${encodeURIComponent(jobId)}`)),
+          onDone: (data) => updateExecutionJob(data.job?.job_id || jobId),
+        });
+      }
+
+      async function loadExecutionLogs() {
+        const jobId = currentExecutionJobId();
+        if (!jobId) throw new Error("当前没有可用 execution job_id");
+        return runAction({
+          ids: ["executionRunBtn", "executionStatusBtn", "executionLogsBtn", "executionArtifactsBtn"],
+          outputId: "executionLogsOutput",
+          loadingText: "正在加载 execution 日志...",
+          fn: async () => parseJson(await authorizedFetch(`/gateway/exec/${encodeURIComponent(jobId)}/logs`)),
+        });
+      }
+
+      async function loadExecutionArtifacts() {
+        const jobId = currentExecutionJobId();
+        if (!jobId) throw new Error("当前没有可用 execution job_id");
+        return runAction({
+          ids: ["executionRunBtn", "executionStatusBtn", "executionLogsBtn", "executionArtifactsBtn"],
+          outputId: "executionArtifactsOutput",
+          loadingText: "正在加载 execution 产物...",
+          fn: async () => parseJson(await authorizedFetch(`/gateway/exec/${encodeURIComponent(jobId)}/artifacts`)),
+        });
+      }
+
       function aliasOptions(selectedAlias) {
         const aliases = ["", ...state.aliases];
         return aliases.map((alias) => `<option value="${alias}" ${alias === (selectedAlias || "") ? "selected" : ""}>${alias || "默认路由"}</option>`).join("");
@@ -786,6 +931,7 @@ def render_debug_page() -> str:
           <div class="timeline-item">
             <strong>${item.title}</strong>
             <div class="mini">${item.timestamp} | ${item.event_type}</div>
+            ${item.payload?.phase ? `<div class="mini">phase=${item.payload.phase}</div>` : ""}
             <div style="margin-top:8px;">${item.summary}</div>
           </div>
         `).join("");
@@ -819,6 +965,10 @@ def render_debug_page() -> str:
       $("workspaceMcpListBtn").addEventListener("click", () => workspaceMcp("list"));
       $("workspaceMcpReadBtn").addEventListener("click", () => workspaceMcp("read"));
       $("workspaceMcpWriteBtn").addEventListener("click", () => workspaceMcp("write"));
+      $("executionRunBtn").addEventListener("click", runExecution);
+      $("executionStatusBtn").addEventListener("click", loadExecutionStatus);
+      $("executionLogsBtn").addEventListener("click", loadExecutionLogs);
+      $("executionArtifactsBtn").addEventListener("click", loadExecutionArtifacts);
       $("externalListBtn").addEventListener("click", () => listExternalAgents(false));
       $("externalRefreshBtn").addEventListener("click", refreshExternalAgents);
       $("externalInvokeBtn").addEventListener("click", invokeExternalAgent);

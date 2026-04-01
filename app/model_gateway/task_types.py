@@ -6,6 +6,7 @@ TASK_KNOWLEDGE = "knowledge"
 TASK_WORKSPACE = "workspace"
 TASK_TESTING = "testing"
 TASK_EXTERNAL_BROKER = "external_broker"
+TASK_EXECUTION = "execution"
 
 KNOWN_TASK_TYPES = {
     TASK_GENERAL,
@@ -14,4 +15,5 @@ KNOWN_TASK_TYPES = {
     TASK_WORKSPACE,
     TASK_TESTING,
     TASK_EXTERNAL_BROKER,
+    TASK_EXECUTION,
 }

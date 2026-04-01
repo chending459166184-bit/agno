@@ -176,6 +176,45 @@ class Database:
             Column("config_json", JSON, nullable=False),
             Column("updated_at", DateTime(timezone=True), nullable=False),
         )
+        self.execution_jobs = Table(
+            "execution_jobs",
+            self.metadata,
+            Column("job_id", String, primary_key=True),
+            Column("trace_id", String, nullable=False),
+            Column("request_id", String, nullable=False),
+            Column("session_id", String, nullable=True),
+            Column("tenant_id", String, nullable=False),
+            Column("user_id", String, nullable=False),
+            Column("project_id", String, nullable=False),
+            Column("status", String, nullable=False),
+            Column("language", String, nullable=False),
+            Column("command", Text, nullable=False),
+            Column("entrypoint", String, nullable=True),
+            Column("sandbox_mode", String, nullable=False),
+            Column("sandbox_id", String, nullable=True),
+            Column("workspace_root", String, nullable=False),
+            Column("job_root", String, nullable=False),
+            Column("started_at", DateTime(timezone=True), nullable=True),
+            Column("finished_at", DateTime(timezone=True), nullable=True),
+            Column("duration_ms", Integer, nullable=True),
+            Column("exit_code", Integer, nullable=True),
+            Column("stdout_path", String, nullable=True),
+            Column("stderr_path", String, nullable=True),
+            Column("artifact_count", Integer, nullable=False),
+            Column("network_enabled", Boolean, nullable=False),
+            Column("writeback_enabled", Boolean, nullable=False),
+            Column("resource_json", JSON, nullable=False),
+        )
+        self.execution_artifacts = Table(
+            "execution_artifacts",
+            self.metadata,
+            Column("artifact_id", String, primary_key=True),
+            Column("job_id", String, nullable=False),
+            Column("relative_path", String, nullable=False),
+            Column("size_bytes", Integer, nullable=False),
+            Column("mime_type", String, nullable=False),
+            Column("created_at", DateTime(timezone=True), nullable=False),
+        )
 
     def init_schema(self) -> None:
         self.metadata.create_all(self.engine)
@@ -187,6 +226,8 @@ class Database:
                 self.content_chunks,
                 self.contents,
                 self.runs,
+                self.execution_artifacts,
+                self.execution_jobs,
                 self.session_contexts,
                 self.user_agent_bindings,
                 self.agent_catalog,
@@ -481,6 +522,137 @@ class Database:
                 .order_by(self.runs.c.created_at.desc())
             ).mappings().first()
         return dict(row) if row else None
+
+    def create_execution_job(
+        self,
+        *,
+        ctx: RequestContext,
+        language: str,
+        command: str,
+        entrypoint: str | None,
+        sandbox_mode: str,
+        workspace_root: str,
+        job_root: str,
+        network_enabled: bool,
+        writeback_enabled: bool,
+        resource_json: dict,
+    ) -> str:
+        job_id = f"job_{uuid4().hex[:18]}"
+        with self.engine.begin() as conn:
+            conn.execute(
+                insert(self.execution_jobs).values(
+                    job_id=job_id,
+                    trace_id=ctx.trace_id,
+                    request_id=ctx.request_id,
+                    session_id=ctx.session_id,
+                    tenant_id=ctx.tenant_id,
+                    user_id=ctx.user_id,
+                    project_id=ctx.project_id,
+                    status="queued",
+                    language=language,
+                    command=command,
+                    entrypoint=entrypoint,
+                    sandbox_mode=sandbox_mode,
+                    sandbox_id=None,
+                    workspace_root=workspace_root,
+                    job_root=job_root,
+                    started_at=None,
+                    finished_at=None,
+                    duration_ms=None,
+                    exit_code=None,
+                    stdout_path=None,
+                    stderr_path=None,
+                    artifact_count=0,
+                    network_enabled=network_enabled,
+                    writeback_enabled=writeback_enabled,
+                    resource_json=resource_json,
+                )
+            )
+        return job_id
+
+    def update_execution_job_paths(self, job_id: str, *, job_root: str) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(
+                self.execution_jobs.update()
+                .where(self.execution_jobs.c.job_id == job_id)
+                .values(job_root=job_root)
+            )
+
+    def mark_execution_job_running(self, job_id: str) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(
+                self.execution_jobs.update()
+                .where(self.execution_jobs.c.job_id == job_id)
+                .values(status="running", started_at=utcnow())
+            )
+
+    def complete_execution_job(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        sandbox_mode: str,
+        sandbox_id: str | None,
+        duration_ms: int | None,
+        exit_code: int | None,
+        stdout_path: str | None,
+        stderr_path: str | None,
+        artifact_count: int,
+        resource_json: dict,
+    ) -> None:
+        with self.engine.begin() as conn:
+            conn.execute(
+                self.execution_jobs.update()
+                .where(self.execution_jobs.c.job_id == job_id)
+                .values(
+                    status=status,
+                    sandbox_mode=sandbox_mode,
+                    sandbox_id=sandbox_id,
+                    duration_ms=duration_ms,
+                    exit_code=exit_code,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    artifact_count=artifact_count,
+                    resource_json=resource_json,
+                    finished_at=utcnow(),
+                )
+            )
+
+    def get_execution_job(self, job_id: str) -> dict | None:
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                select(self.execution_jobs).where(self.execution_jobs.c.job_id == job_id)
+            ).mappings().first()
+        return dict(row) if row else None
+
+    def add_execution_artifact(
+        self,
+        *,
+        job_id: str,
+        relative_path: str,
+        size_bytes: int,
+        mime_type: str,
+    ) -> dict:
+        payload = {
+            "artifact_id": f"artifact_{uuid4().hex[:18]}",
+            "job_id": job_id,
+            "relative_path": relative_path,
+            "size_bytes": size_bytes,
+            "mime_type": mime_type,
+            "created_at": utcnow(),
+        }
+        with self.engine.begin() as conn:
+            conn.execute(insert(self.execution_artifacts).values(**payload))
+        return payload
+
+    def list_execution_artifacts(self, job_id: str) -> list[dict]:
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                select(self.execution_artifacts)
+                .where(self.execution_artifacts.c.job_id == job_id)
+                .order_by(self.execution_artifacts.c.relative_path.asc())
+            ).mappings().all()
+        return [dict(row) for row in rows]
 
     def ingest_document(
         self,
@@ -1015,6 +1187,113 @@ class Database:
             user_id=ctx.user_id,
             event_type="prefetch_triggered",
             payload={"project_id": ctx.project_id, **payload},
+        )
+
+    def record_workspace_guard_data_captured(self, ctx: RequestContext, *, payload: dict) -> None:
+        self.append_audit(
+            trace_id=ctx.trace_id,
+            request_id=ctx.request_id,
+            session_id=ctx.session_id,
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            event_type="workspace_guard_data_captured",
+            payload={"project_id": ctx.project_id, **payload},
+        )
+
+    def record_workspace_guard_compose_started(self, ctx: RequestContext, *, payload: dict) -> None:
+        self.append_audit(
+            trace_id=ctx.trace_id,
+            request_id=ctx.request_id,
+            session_id=ctx.session_id,
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            event_type="workspace_guard_compose_started",
+            payload={"project_id": ctx.project_id, **payload},
+        )
+
+    def record_workspace_guard_compose_succeeded(self, ctx: RequestContext, *, payload: dict) -> None:
+        self.append_audit(
+            trace_id=ctx.trace_id,
+            request_id=ctx.request_id,
+            session_id=ctx.session_id,
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            event_type="workspace_guard_compose_succeeded",
+            payload={"project_id": ctx.project_id, **payload},
+        )
+
+    def record_workspace_guard_compose_failed(self, ctx: RequestContext, *, payload: dict) -> None:
+        self.append_audit(
+            trace_id=ctx.trace_id,
+            request_id=ctx.request_id,
+            session_id=ctx.session_id,
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            event_type="workspace_guard_compose_failed",
+            payload={"project_id": ctx.project_id, **payload},
+        )
+
+    def _record_sandbox_event(
+        self,
+        ctx: RequestContext,
+        *,
+        event_type: str,
+        job_id: str,
+        payload: dict,
+    ) -> None:
+        self.append_audit(
+            trace_id=ctx.trace_id,
+            request_id=ctx.request_id,
+            session_id=ctx.session_id,
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            event_type=event_type,
+            payload={"project_id": ctx.project_id, "job_id": job_id, **payload},
+        )
+
+    def record_sandbox_job_created(self, ctx: RequestContext, *, job_id: str, payload: dict) -> None:
+        self._record_sandbox_event(ctx, event_type="sandbox_job_created", job_id=job_id, payload=payload)
+
+    def record_sandbox_stage_prepared(self, ctx: RequestContext, *, job_id: str, payload: dict) -> None:
+        self._record_sandbox_event(ctx, event_type="sandbox_stage_prepared", job_id=job_id, payload=payload)
+
+    def record_sandbox_started(self, ctx: RequestContext, *, job_id: str, payload: dict) -> None:
+        self._record_sandbox_event(ctx, event_type="sandbox_started", job_id=job_id, payload=payload)
+
+    def record_sandbox_completed(self, ctx: RequestContext, *, job_id: str, payload: dict) -> None:
+        self._record_sandbox_event(ctx, event_type="sandbox_completed", job_id=job_id, payload=payload)
+
+    def record_sandbox_failed(self, ctx: RequestContext, *, job_id: str, payload: dict) -> None:
+        self._record_sandbox_event(ctx, event_type="sandbox_failed", job_id=job_id, payload=payload)
+
+    def record_sandbox_timeout(self, ctx: RequestContext, *, job_id: str, payload: dict) -> None:
+        self._record_sandbox_event(ctx, event_type="sandbox_timeout", job_id=job_id, payload=payload)
+
+    def record_sandbox_killed(self, ctx: RequestContext, *, job_id: str, payload: dict) -> None:
+        self._record_sandbox_event(ctx, event_type="sandbox_killed", job_id=job_id, payload=payload)
+
+    def record_sandbox_artifact_recorded(self, ctx: RequestContext, *, job_id: str, payload: dict) -> None:
+        self._record_sandbox_event(
+            ctx,
+            event_type="sandbox_artifact_recorded",
+            job_id=job_id,
+            payload=payload,
+        )
+
+    def record_sandbox_writeback_applied(self, ctx: RequestContext, *, job_id: str, payload: dict) -> None:
+        self._record_sandbox_event(
+            ctx,
+            event_type="sandbox_writeback_applied",
+            job_id=job_id,
+            payload=payload,
+        )
+
+    def record_sandbox_writeback_skipped(self, ctx: RequestContext, *, job_id: str, payload: dict) -> None:
+        self._record_sandbox_event(
+            ctx,
+            event_type="sandbox_writeback_skipped",
+            job_id=job_id,
+            payload=payload,
         )
 
 

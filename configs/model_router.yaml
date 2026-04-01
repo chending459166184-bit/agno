@@ -3,7 +3,7 @@ default_task_type: general
 aliases:
   coder-premium:
     description: ChatGPT Subscription / Codex via local adapter
-    supports_tools: false
+    supports_tools: true
     provider_kind: codex_subscription
   coder-api:
     description: OpenAI API key via LiteLLM Proxy
@@ -45,6 +45,13 @@ task_routes:
       - coder-api
       - glm-coder
       - minimax-general
+  execution:
+    aliases:
+      - coder-premium
+      - coder-api
+      - glm-coder
+      - minimax-general
+    requires_tools: true
   external_broker:
     aliases:
       - coder-premium

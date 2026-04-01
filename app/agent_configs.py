@@ -34,7 +34,7 @@ SYSTEM_AGENT_DEFAULTS = [
         "default_priority": 80,
         "default_allow_auto_route": True,
         "default_model_alias_task": "knowledge",
-        "skills_group": [],
+        "skills_group": ["knowledge"],
         "tool_summary": ["search_project_knowledge"],
     },
     {
@@ -48,7 +48,7 @@ SYSTEM_AGENT_DEFAULTS = [
         "default_priority": 70,
         "default_allow_auto_route": True,
         "default_model_alias_task": "workspace",
-        "skills_group": [],
+        "skills_group": ["workspace"],
         "tool_summary": ["workspace MCPTools"],
     },
     {
@@ -64,6 +64,20 @@ SYSTEM_AGENT_DEFAULTS = [
         "default_model_alias_task": "testing",
         "skills_group": ["testing"],
         "tool_summary": ["Testing skill playbook"],
+    },
+    {
+        "agent_key": "execution_agent",
+        "display_name": "Execution Agent",
+        "agent_type": "internal",
+        "description": "在独立 sandbox 中运行代码、脚本和受控命令，并返回日志与产物摘要。",
+        "is_system": True,
+        "is_editable": True,
+        "default_enabled": True,
+        "default_priority": 65,
+        "default_allow_auto_route": True,
+        "default_model_alias_task": "execution",
+        "skills_group": ["execution"],
+        "tool_summary": ["exec sandbox"],
     },
     {
         "agent_key": "external_agent_broker",
@@ -86,6 +100,7 @@ AGENT_TASK_TYPE = {
     "knowledge_agent": "knowledge",
     "workspace_agent": "workspace",
     "test_agent": "testing",
+    "execution_agent": "execution",
     "external_agent_broker": "external_broker",
 }
 

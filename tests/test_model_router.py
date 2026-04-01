@@ -28,7 +28,7 @@ def test_router_prefers_configured_aliases_when_keys_exist() -> None:
     assert route.alias == "coder-api"
 
 
-def test_router_can_fallback_to_coder_premium_without_tool_support() -> None:
+def test_router_can_use_coder_premium_for_tool_routes() -> None:
     os.environ["OPENAI_API_KEY"] = ""
     os.environ["OPENAI_CODER_MODEL"] = "openai/gpt-5.3-codex"
     os.environ["MINIMAX_API_KEY"] = ""
@@ -43,4 +43,4 @@ def test_router_can_fallback_to_coder_premium_without_tool_support() -> None:
 
     route = router.resolve("workspace", preferred_aliases={"coder-premium"})
     assert route.alias == "coder-premium"
-    assert route.reason == "matched_healthy_alias_without_tool_support"
+    assert route.reason == "matched_healthy_alias"

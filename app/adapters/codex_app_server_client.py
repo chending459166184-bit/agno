@@ -7,9 +7,29 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from app.config import Settings
+
+
+@dataclass(slots=True)
+class CodexDynamicTool:
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+
+    def as_payload(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "inputSchema": self.input_schema,
+        }
+
+
+@dataclass(slots=True)
+class CodexToolCall:
+    call_id: str
+    tool: str
+    arguments: dict[str, Any]
 
 
 @dataclass(slots=True)
@@ -19,6 +39,7 @@ class CodexTurnResult:
     turn_id: str
     model: str
     provider: str
+    tool_call: CodexToolCall | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
     stderr_lines: list[str] = field(default_factory=list)
 
@@ -38,6 +59,8 @@ class CodexAppServerClient:
         cwd: Path | None = None,
         model: str | None = None,
         timeout_seconds: float | None = None,
+        dynamic_tools: list[CodexDynamicTool] | None = None,
+        stop_on_tool_call: bool = False,
     ) -> CodexTurnResult:
         active_cwd = str((cwd or self.cwd).resolve())
         provider_model = model or self.settings.coder_premium_model
@@ -61,6 +84,7 @@ class CodexAppServerClient:
         thread_id: str | None = None
         turn_id: str | None = None
         provider = "openai"
+        tool_call: CodexToolCall | None = None
         try:
             self._send(
                 process,
@@ -81,7 +105,12 @@ class CodexAppServerClient:
             next_id += 1
 
             self._send(process, {"method": "initialized", "params": {}})
-            self._send(process, {"id": next_id, "method": "thread/start", "params": {}})
+            thread_start_params: dict[str, Any] = {}
+            if dynamic_tools:
+                thread_start_params["dynamicTools"] = [
+                    tool.as_payload() for tool in dynamic_tools
+                ]
+            self._send(process, {"id": next_id, "method": "thread/start", "params": thread_start_params})
             thread_response = self._expect_response(process, next_id, timeout, stderr_lines)
             next_id += 1
 
@@ -147,6 +176,14 @@ class CodexAppServerClient:
                     delta = str(params.get("delta") or "")
                     if delta:
                         deltas.append(delta)
+                elif method == "item/tool/call":
+                    tool_call = CodexToolCall(
+                        call_id=str(params.get("callId") or f"call_{int(time.time() * 1000)}"),
+                        tool=str(params.get("tool") or ""),
+                        arguments=params.get("arguments") or {},
+                    )
+                    if stop_on_tool_call:
+                        break
                 elif method == "item/completed":
                     item = params.get("item") or {}
                     if item.get("type") == "agentMessage":
@@ -165,7 +202,7 @@ class CodexAppServerClient:
                             break
 
             text = (final_text or "".join(deltas)).strip()
-            if not text:
+            if not text and tool_call is None:
                 diagnostic = stderr_lines[-1] if stderr_lines else "未收到模型文本输出"
                 raise RuntimeError(f"Codex app-server 没有返回可用文本: {diagnostic}")
             return CodexTurnResult(
@@ -174,6 +211,7 @@ class CodexAppServerClient:
                 turn_id=turn_id,
                 model=provider_model,
                 provider=provider,
+                tool_call=tool_call,
                 events=events,
                 stderr_lines=stderr_lines,
             )

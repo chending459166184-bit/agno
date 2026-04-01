@@ -20,6 +20,7 @@ from app.external_agents import (
     ExternalAgentRegistry,
 )
 from app.debug_ui import render_debug_page
+from app.execution import ExecutionManager, ExecutionRequest
 from app.model_gateway import LiteLLMHealthChecker, ModelRegistry, ModelRouter
 from app.runtime import OrchestratorRuntime
 from app.trace_view import build_trace_summary
@@ -113,6 +114,7 @@ class AppServices:
             self.external_registry,
             self.a2a_client,
         )
+        self.execution_manager = ExecutionManager(settings, self.database)
         self.runtime = OrchestratorRuntime(
             settings,
             self.database,
@@ -120,6 +122,7 @@ class AppServices:
             self.health_checker,
             self.external_broker,
             self.agent_config_service,
+            self.execution_manager,
         )
 
     def build_context(
@@ -663,6 +666,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "enabled": svc.settings.external_prefetch_enabled,
                     "mode": svc.settings.external_prefetch_mode,
                 },
+                "execution": {
+                    "enabled": svc.settings.exec_sandbox_enabled,
+                    "configured_mode": svc.settings.exec_sandbox_mode,
+                    "jobs_root": str(svc.settings.resolved_exec_jobs_root),
+                    "network_enabled": svc.settings.exec_allow_network,
+                    "writeback_enabled": svc.settings.exec_allow_workspace_writeback,
+                    "default_timeout_seconds": svc.settings.exec_default_timeout_seconds,
+                    "max_timeout_seconds": svc.settings.exec_max_timeout_seconds,
+                    "default_memory_mb": svc.settings.exec_default_memory_mb,
+                    "max_memory_mb": svc.settings.exec_max_memory_mb,
+                    "default_cpu_limit": svc.settings.exec_default_cpu_limit,
+                },
                 "router_defaults": svc.model_registry.default_aliases_by_task(),
                 "external_agents": svc.external_registry.status(),
             }
@@ -871,6 +886,118 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "project_id": ctx.project_id,
             **data,
         }
+
+    def _authorized_execution_job(
+        job_id: str,
+        *,
+        user: AuthenticatedUser,
+        svc: AppServices,
+    ):
+        try:
+            job = svc.execution_manager.get_job(job_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="execution job 不存在") from exc
+        if job.tenant_id != user.tenant_id or job.user_id != user.user_id:
+            raise HTTPException(status_code=403, detail="无权访问该 execution job")
+        return job
+
+    @base_app.post("/gateway/exec/run")
+    def exec_run(
+        body: ExecutionRequest,
+        user: AuthenticatedUser = Depends(get_current_user),
+        svc: AppServices = Depends(get_services),
+    ) -> dict:
+        ctx = svc.build_context(user=user, project_id=body.project_id, session_id=body.session_id)
+        svc.database.append_audit(
+            trace_id=ctx.trace_id,
+            request_id=ctx.request_id,
+            session_id=ctx.session_id,
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            event_type="gateway_request",
+            payload={
+                "project_id": ctx.project_id,
+                "message": body.command or body.entrypoint or "execution_request",
+                "request_kind": "exec_run",
+            },
+        )
+        try:
+            result = svc.execution_manager.run(ctx, body)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        svc.database.append_audit(
+            trace_id=ctx.trace_id,
+            request_id=ctx.request_id,
+            session_id=ctx.session_id,
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            event_type="gateway_response",
+            payload={
+                "run_id": result.job.job_id,
+                "mode": "execution",
+                "selected_agents": ["Execution Agent"],
+                "knowledge_hit_count": 0,
+                "knowledge_hits": [],
+                "model_routes": {},
+                "prefetch_info": {},
+                "effective_agents": [],
+            },
+        )
+        return result.model_dump(mode="json")
+
+    @base_app.get("/gateway/exec/{job_id}")
+    def exec_status(
+        job_id: str,
+        user: AuthenticatedUser = Depends(get_current_user),
+        svc: AppServices = Depends(get_services),
+    ) -> dict:
+        _authorized_execution_job(job_id, user=user, svc=svc)
+        return svc.execution_manager.get_result_for_job(job_id).model_dump(mode="json")
+
+    @base_app.get("/gateway/exec/{job_id}/logs")
+    def exec_logs(
+        job_id: str,
+        user: AuthenticatedUser = Depends(get_current_user),
+        svc: AppServices = Depends(get_services),
+    ) -> dict:
+        job = _authorized_execution_job(job_id, user=user, svc=svc)
+        return {
+            "job_id": job.job_id,
+            "trace_id": job.trace_id,
+            **svc.execution_manager.get_logs(job_id),
+        }
+
+    @base_app.get("/gateway/exec/{job_id}/artifacts")
+    def exec_artifacts(
+        job_id: str,
+        user: AuthenticatedUser = Depends(get_current_user),
+        svc: AppServices = Depends(get_services),
+    ) -> dict:
+        job = _authorized_execution_job(job_id, user=user, svc=svc)
+        artifacts = svc.execution_manager.list_artifacts(job_id)
+        return {
+            "job_id": job.job_id,
+            "trace_id": job.trace_id,
+            "count": len(artifacts),
+            "artifacts": [item.model_dump(mode="json") for item in artifacts],
+        }
+
+    @base_app.get("/gateway/exec/{job_id}/artifacts/{artifact_path:path}")
+    def exec_artifact_read(
+        job_id: str,
+        artifact_path: str,
+        user: AuthenticatedUser = Depends(get_current_user),
+        svc: AppServices = Depends(get_services),
+    ) -> dict:
+        _authorized_execution_job(job_id, user=user, svc=svc)
+        try:
+            return svc.execution_manager.read_artifact(job_id, artifact_path)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="artifact 不存在") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @base_app.get("/gateway/external-agents")
     def external_agents(

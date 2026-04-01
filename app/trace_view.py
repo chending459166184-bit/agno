@@ -11,11 +11,25 @@ EVENT_TITLES = {
     "prefetch_triggered": "外部兜底触发",
     "member_output_captured": "子智能体输出",
     "mcp_tool_call": "Workspace MCP 工具调用",
+    "workspace_guard_data_captured": "Workspace Guard 数据已捕获",
+    "workspace_guard_compose_started": "Workspace Guard 表达生成开始",
+    "workspace_guard_compose_succeeded": "Workspace Guard 表达生成成功",
+    "workspace_guard_compose_failed": "Workspace Guard 表达生成失败",
     "external_agent_discovery": "External agents 发现",
     "external_agent_selected": "External agent 选择",
     "a2a_request_sent": "A2A 请求已发送",
     "a2a_response_received": "A2A 响应已收到",
     "a2a_error": "A2A 调用错误",
+    "sandbox_job_created": "Sandbox Job 已创建",
+    "sandbox_stage_prepared": "Sandbox 工作目录已准备",
+    "sandbox_started": "Sandbox 开始执行",
+    "sandbox_completed": "Sandbox 执行完成",
+    "sandbox_failed": "Sandbox 执行失败",
+    "sandbox_timeout": "Sandbox 执行超时",
+    "sandbox_killed": "Sandbox 已终止",
+    "sandbox_artifact_recorded": "Sandbox 产物已记录",
+    "sandbox_writeback_applied": "Sandbox 写回已应用",
+    "sandbox_writeback_skipped": "Sandbox 写回已跳过",
 }
 
 
@@ -39,9 +53,21 @@ def _summary_for_event(event_type: str, payload: dict[str, Any]) -> str:
             f"| category={payload.get('category') or 'n/a'}"
         )
     if event_type == "member_output_captured":
-        return f"{payload.get('member_name')}: {str(payload.get('content') or '')[:120]}"
+        return (
+            f"{payload.get('member_name')} | phase={payload.get('phase')}: "
+            f"{str(payload.get('content') or '')[:120]}"
+        )
     if event_type == "mcp_tool_call":
         return f"{payload.get('tool_name')} | path={payload.get('path') or payload.get('prefix') or ''}"
+    if event_type == "workspace_guard_data_captured":
+        safe_payload = payload.get("safe_payload") or {}
+        return f"action={payload.get('action')} | root={safe_payload.get('root')}"
+    if event_type == "workspace_guard_compose_started":
+        return f"action={payload.get('action')} | source={payload.get('source')}"
+    if event_type == "workspace_guard_compose_succeeded":
+        return f"action={payload.get('action')} | {str(payload.get('answer_excerpt') or '')[:120]}"
+    if event_type == "workspace_guard_compose_failed":
+        return f"action={payload.get('action')} | {payload.get('error')}"
     if event_type == "external_agent_discovery":
         return f"count={payload.get('agent_count')} | cache={payload.get('from_cache')}"
     if event_type == "external_agent_selected":
@@ -52,6 +78,23 @@ def _summary_for_event(event_type: str, payload: dict[str, Any]) -> str:
         return f"{payload.get('agent_id')} | {str(payload.get('text_excerpt') or '')[:120]}"
     if event_type == "a2a_error":
         return f"{payload.get('agent_id')} | {payload.get('error')}"
+    if event_type == "sandbox_job_created":
+        return f"{payload.get('job_id')} | {payload.get('command') or payload.get('entrypoint') or ''}"
+    if event_type == "sandbox_stage_prepared":
+        return f"{payload.get('job_id')} | seed_files={payload.get('seed_file_count')}"
+    if event_type == "sandbox_started":
+        return f"{payload.get('job_id')} | mode={payload.get('sandbox_mode')}"
+    if event_type in {"sandbox_completed", "sandbox_failed", "sandbox_timeout", "sandbox_killed"}:
+        return (
+            f"{payload.get('job_id')} | mode={payload.get('sandbox_mode')} | "
+            f"exit={payload.get('exit_code')} | duration_ms={payload.get('duration_ms')}"
+        )
+    if event_type == "sandbox_artifact_recorded":
+        return f"{payload.get('job_id')} | {payload.get('relative_path')}"
+    if event_type == "sandbox_writeback_applied":
+        return f"{payload.get('job_id')} | count={payload.get('count')}"
+    if event_type == "sandbox_writeback_skipped":
+        return f"{payload.get('job_id')} | status={payload.get('status')}"
     return str(payload)[:120]
 
 
