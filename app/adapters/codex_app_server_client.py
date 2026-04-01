@@ -26,7 +26,10 @@ class CodexTurnResult:
 class CodexAppServerClient:
     def __init__(self, settings: Settings, *, cwd: Path | None = None) -> None:
         self.settings = settings
-        self.cwd = cwd or settings.project_root
+        safe_root = settings.resolved_codex_safe_cwd_root
+        safe_root.mkdir(parents=True, exist_ok=True)
+        self.cwd = (cwd or safe_root / "general").resolve()
+        self.cwd.mkdir(parents=True, exist_ok=True)
 
     def complete(
         self,

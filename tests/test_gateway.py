@@ -31,6 +31,9 @@ def create_test_client(tmp_path: Path) -> TestClient:
     os.environ["ZAI_MODEL_ID"] = ""
     os.environ["LITELLM_PROXY_BASE_URL"] = "http://127.0.0.1:9"
     os.environ["LITELLM_REQUEST_TIMEOUT_SECONDS"] = "0.2"
+    os.environ["MCP_ALLOW_WRITE"] = "true"
+    os.environ["EXTERNAL_PREFETCH_ENABLED"] = "true"
+    os.environ["EXTERNAL_PREFETCH_MODE"] = "prefetch"
 
     import app.config
     import app.main
@@ -164,6 +167,8 @@ def test_runtime_status_is_based_on_litellm_proxy_health(tmp_path: Path) -> None
     assert body["live_model_configured"] is False
     assert body["proxy_reachable"] is False
     assert body["router_defaults"]["orchestrate"] == "coder-premium"
+    assert body["mcp_allow_write"] is True
+    assert body["external_prefetch"]["mode"] == "prefetch"
     assert body["aliases"]
     assert body["external_agents"]["count"] >= 1
 
@@ -181,3 +186,140 @@ def test_external_agents_endpoint_returns_discovered_agents(tmp_path: Path) -> N
     assert body["count"] >= 1
     agent_ids = {item["agent_id"] for item in body["agents"]}
     assert "compliance-reviewer" in agent_ids
+
+
+def test_dev_users_and_knowledge_endpoint_expose_richer_debug_fields(tmp_path: Path) -> None:
+    client = create_test_client(tmp_path)
+
+    users = client.get("/gateway/dev-users")
+    assert users.status_code == 200
+    user_ids = {item["user_id"] for item in users.json()["users"]}
+    assert {"alice", "bob", "charlie"} <= user_ids
+
+    token = client.get("/gateway/dev-token/alice").json()["token"]
+    response = client.get(
+        "/gateway/knowledge",
+        params={"q": "运维 手册", "project_id": "beta"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["user_id"] == "alice"
+    assert body["project_id"] == "beta"
+    assert body["query"] == "运维 手册"
+    assert body["hit_count"] >= 1
+    assert any(hit["scope_id"] == "beta" for hit in body["hits"])
+
+
+def test_workspace_mcp_probe_can_write_and_trace_summary_shows_timeline(tmp_path: Path) -> None:
+    client = create_test_client(tmp_path)
+    token = client.get("/gateway/dev-token/alice").json()["token"]
+
+    write_res = client.post(
+        "/gateway/debug/workspace-mcp/write",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "project_id": "alpha",
+            "path": "notes/mcp-probe.txt",
+            "content": "hello from mcp",
+            "overwrite": True,
+        },
+    )
+    assert write_res.status_code == 200
+    write_body = write_res.json()
+    assert write_body["ok"] is True
+    assert write_body["path"] == "notes/mcp-probe.txt"
+
+    read_res = client.post(
+        "/gateway/debug/workspace-mcp/read",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"project_id": "alpha", "path": "notes/mcp-probe.txt"},
+    )
+    assert read_res.status_code == 200
+    assert "hello from mcp" in read_res.json()["content"]
+
+    summary = client.get(f"/gateway/trace/{write_body['trace_id']}/summary")
+    assert summary.status_code == 200
+    timeline = summary.json()["audit_timeline"]
+    assert any(item["event_type"] == "mcp_tool_call" for item in timeline)
+
+
+def test_agent_config_override_changes_effective_agents(tmp_path: Path) -> None:
+    client = create_test_client(tmp_path)
+    token = client.get("/gateway/dev-token/alice").json()["token"]
+
+    before = client.get(
+        "/gateway/agent-configs/effective",
+        params={"project_id": "alpha"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert before.status_code == 200
+    items = {item["agent_key"]: item for item in before.json()["items"]}
+    assert items["workspace_agent"]["included_in_team"] is True
+
+    update = client.put(
+        "/gateway/agent-configs/workspace_agent",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"project_id": "alpha", "enabled": False, "allow_auto_route": False, "priority": 10},
+    )
+    assert update.status_code == 200
+
+    after = client.get(
+        "/gateway/agent-configs/effective",
+        params={"project_id": "alpha"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert after.status_code == 200
+    items = {item["agent_key"]: item for item in after.json()["items"]}
+    assert items["workspace_agent"]["enabled"] is False
+    assert items["workspace_agent"]["included_in_team"] is False
+
+
+def test_chat_file_intent_is_forced_through_workspace_guard(tmp_path: Path) -> None:
+    client = create_test_client(tmp_path)
+    token = client.get("/gateway/dev-token/charlie").json()["token"]
+
+    response = client.post(
+        "/gateway/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"message": "当前我目录下有哪些文件", "project_id": "alpha"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mode"] == "workspace_guard"
+    assert body["user_id"] == "charlie"
+    assert body["workspace_root"].endswith("/demo/charlie")
+    assert body["selected_agents"] == ["Workspace Agent"]
+    assert body["member_outputs"]
+    assert any(item["name"] == "Workspace Agent" for item in body["member_outputs"])
+    assert "notes/alpha-analysis.md" in body["answer"]
+    assert ".env" not in body["answer"]
+    assert "app/" not in body["answer"]
+
+    summary = client.get(f"/gateway/trace/{body['trace_id']}/summary")
+    assert summary.status_code == 200
+    timeline = summary.json()["audit_timeline"]
+    assert any(item["event_type"] == "mcp_tool_call" for item in timeline)
+    assert any(
+        item["payload"].get("tool_name") == "workspace_list_files"
+        for item in timeline
+        if item["event_type"] == "mcp_tool_call"
+    )
+
+
+def test_chat_shorter_file_phrase_still_hits_workspace_guard(tmp_path: Path) -> None:
+    client = create_test_client(tmp_path)
+    token = client.get("/gateway/dev-token/alice").json()["token"]
+
+    response = client.post(
+        "/gateway/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"message": "我目录有哪些文件", "project_id": "alpha"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mode"] == "workspace_guard"
+    assert body["selected_agents"] == ["Workspace Agent"]
+    assert ".env" not in body["answer"]
+    assert "app/" not in body["answer"]
+    assert "notes/customer-risk.md" in body["answer"] or "notes/beta-handoff.md" in body["answer"]

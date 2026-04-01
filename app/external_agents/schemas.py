@@ -33,10 +33,21 @@ class A2ADefaultConfig(BaseModel):
     bearer_prefix: str = "Bearer"
 
 
+class PrefetchRuleConfig(BaseModel):
+    category: str = ""
+    keywords: list[str] = Field(default_factory=list)
+
+
+class PrefetchConfig(BaseModel):
+    record_reason: bool = True
+    rules: list[PrefetchRuleConfig] = Field(default_factory=list)
+
+
 class AgentDiscoveryConfig(BaseModel):
     refresh_ttl_seconds: int = 60
     filters: DiscoveryFilterPolicy = Field(default_factory=DiscoveryFilterPolicy)
     default_a2a: A2ADefaultConfig = Field(default_factory=A2ADefaultConfig)
+    prefetch: PrefetchConfig = Field(default_factory=PrefetchConfig)
     sources: list[DiscoverySourceConfig] = Field(default_factory=list)
 
 
@@ -108,4 +119,3 @@ class BrokerInvocationResult(BaseModel):
     selection: BrokerSelection
     response: A2AInvocationResult
     candidates: list[ExternalAgentCard] = Field(default_factory=list)
-

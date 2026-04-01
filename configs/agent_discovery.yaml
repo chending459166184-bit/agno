@@ -12,6 +12,39 @@ default_a2a:
   auth_header_name: Authorization
   auth_token_env:
 
+prefetch:
+  record_reason: true
+  rules:
+    - category: security
+      keywords:
+        - security
+        - 安全
+        - 审计
+        - 隔离
+        - 边界
+    - category: compliance
+      keywords:
+        - compliance
+        - 合规
+        - 制度
+        - 审批
+        - 验收
+    - category: analytics
+      keywords:
+        - analytics
+        - 分析
+        - 指标
+        - 日志
+        - 运营
+    - category: ""
+      keywords:
+        - external
+        - a2a
+        - broker
+        - 外部
+        - 动态发现
+        - 外部智能体
+
 sources:
   - source_id: local-demo-catalog
     transport: stdio

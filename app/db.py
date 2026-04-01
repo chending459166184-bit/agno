@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
 from sqlalchemy import (
+    Boolean,
     JSON,
     Column,
     DateTime,
+    Integer,
     MetaData,
     String,
     Table,
@@ -27,6 +30,10 @@ from app.workspace import ensure_workspace, save_text_file
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def sqlite_timestamp() -> str:
+    return utcnow().astimezone(timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S.%f")
 
 
 def tokenize(text: str) -> set[str]:
@@ -135,6 +142,40 @@ class Database:
             Column("payload_json", JSON, nullable=False),
             Column("created_at", DateTime(timezone=True), nullable=False),
         )
+        self.agent_catalog = Table(
+            "agent_catalog",
+            self.metadata,
+            Column("agent_key", String, primary_key=True),
+            Column("display_name", String, nullable=False),
+            Column("agent_type", String, nullable=False),
+            Column("description", Text, nullable=False),
+            Column("is_system", Boolean, nullable=False),
+            Column("is_editable", Boolean, nullable=False),
+            Column("default_enabled", Boolean, nullable=False),
+            Column("default_priority", Integer, nullable=False),
+            Column("default_allow_auto_route", Boolean, nullable=False),
+            Column("default_model_alias", String, nullable=True),
+            Column("skills_group", JSON, nullable=False),
+            Column("tool_summary", JSON, nullable=False),
+            Column("created_at", DateTime(timezone=True), nullable=False),
+            Column("updated_at", DateTime(timezone=True), nullable=False),
+        )
+        self.user_agent_bindings = Table(
+            "user_agent_bindings",
+            self.metadata,
+            Column("binding_id", String, primary_key=True),
+            Column("tenant_id", String, nullable=False),
+            Column("user_id", String, nullable=False),
+            Column("project_id", String, nullable=True),
+            Column("agent_key", String, nullable=False),
+            Column("enabled", Boolean, nullable=True),
+            Column("priority", Integer, nullable=True),
+            Column("allow_auto_route", Boolean, nullable=True),
+            Column("preferred_model_alias", String, nullable=True),
+            Column("note", Text, nullable=False),
+            Column("config_json", JSON, nullable=False),
+            Column("updated_at", DateTime(timezone=True), nullable=False),
+        )
 
     def init_schema(self) -> None:
         self.metadata.create_all(self.engine)
@@ -147,6 +188,8 @@ class Database:
                 self.contents,
                 self.runs,
                 self.session_contexts,
+                self.user_agent_bindings,
+                self.agent_catalog,
                 self.users,
             ):
                 conn.execute(delete(table))
@@ -185,6 +228,147 @@ class Database:
                 select(self.users).where(self.users.c.user_id == user_id)
             ).mappings().first()
         return dict(row) if row else None
+
+    def ensure_agent_catalog(self, entries: list[dict]) -> None:
+        now = utcnow()
+        with self.engine.begin() as conn:
+            for entry in entries:
+                agent_key = entry["agent_key"]
+                payload = {
+                    "agent_key": agent_key,
+                    "display_name": entry["display_name"],
+                    "agent_type": entry["agent_type"],
+                    "description": entry["description"],
+                    "is_system": bool(entry["is_system"]),
+                    "is_editable": bool(entry["is_editable"]),
+                    "default_enabled": bool(entry["default_enabled"]),
+                    "default_priority": int(entry["default_priority"]),
+                    "default_allow_auto_route": bool(entry["default_allow_auto_route"]),
+                    "default_model_alias": entry.get("default_model_alias"),
+                    "skills_group": list(entry.get("skills_group") or []),
+                    "tool_summary": list(entry.get("tool_summary") or []),
+                    "updated_at": now,
+                }
+                existing = conn.execute(
+                    select(self.agent_catalog.c.agent_key).where(self.agent_catalog.c.agent_key == agent_key)
+                ).first()
+                if existing:
+                    conn.execute(
+                        self.agent_catalog.update()
+                        .where(self.agent_catalog.c.agent_key == agent_key)
+                        .values(**payload)
+                    )
+                else:
+                    conn.execute(insert(self.agent_catalog).values(**payload, created_at=now))
+
+    def list_agent_catalog(self) -> list[dict]:
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                select(self.agent_catalog).order_by(self.agent_catalog.c.agent_key.asc())
+            ).mappings().all()
+        return [dict(row) for row in rows]
+
+    def get_agent_catalog(self, agent_key: str) -> dict | None:
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                select(self.agent_catalog).where(self.agent_catalog.c.agent_key == agent_key)
+            ).mappings().first()
+        return dict(row) if row else None
+
+    def list_agent_bindings(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+    ) -> list[dict]:
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                select(self.user_agent_bindings)
+                .where(
+                    self.user_agent_bindings.c.tenant_id == tenant_id,
+                    self.user_agent_bindings.c.user_id == user_id,
+                )
+                .order_by(
+                    self.user_agent_bindings.c.project_id.asc().nullsfirst(),
+                    self.user_agent_bindings.c.agent_key.asc(),
+                )
+            ).mappings().all()
+        return [dict(row) for row in rows]
+
+    def upsert_agent_binding(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        project_id: str | None,
+        agent_key: str,
+        enabled: bool | None,
+        priority: int | None,
+        allow_auto_route: bool | None,
+        preferred_model_alias: str | None,
+        note: str,
+        config_json: dict,
+    ) -> dict:
+        now = utcnow()
+        payload = {
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "project_id": project_id,
+            "agent_key": agent_key,
+            "enabled": enabled,
+            "priority": priority,
+            "allow_auto_route": allow_auto_route,
+            "preferred_model_alias": preferred_model_alias,
+            "note": note,
+            "config_json": config_json,
+            "updated_at": now,
+        }
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                select(self.user_agent_bindings).where(
+                    self.user_agent_bindings.c.tenant_id == tenant_id,
+                    self.user_agent_bindings.c.user_id == user_id,
+                    self.user_agent_bindings.c.agent_key == agent_key,
+                    self.user_agent_bindings.c.project_id.is_(project_id)
+                    if project_id is None
+                    else self.user_agent_bindings.c.project_id == project_id,
+                )
+            ).mappings().all()
+            row = rows[0] if rows else None
+            if row:
+                conn.execute(
+                    self.user_agent_bindings.update()
+                    .where(self.user_agent_bindings.c.binding_id == row["binding_id"])
+                    .values(**payload)
+                )
+                binding_id = row["binding_id"]
+            else:
+                binding_id = f"binding_{uuid4().hex[:18]}"
+                conn.execute(insert(self.user_agent_bindings).values(binding_id=binding_id, **payload))
+        return {"binding_id": binding_id, **payload}
+
+    def delete_agent_binding(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        agent_key: str,
+        project_id: str | None,
+    ) -> None:
+        predicate = (
+            self.user_agent_bindings.c.project_id.is_(None)
+            if project_id is None
+            else self.user_agent_bindings.c.project_id == project_id
+        )
+        with self.engine.begin() as conn:
+            conn.execute(
+                self.user_agent_bindings.delete().where(
+                    self.user_agent_bindings.c.tenant_id == tenant_id,
+                    self.user_agent_bindings.c.user_id == user_id,
+                    self.user_agent_bindings.c.agent_key == agent_key,
+                    predicate,
+                )
+            )
 
     def has_content_source(self, source_path: str) -> bool:
         with self.engine.begin() as conn:
@@ -288,6 +472,15 @@ class Database:
                 )
             )
         return run_id
+
+    def get_run_by_trace(self, trace_id: str) -> dict | None:
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                select(self.runs)
+                .where(self.runs.c.trace_id == trace_id)
+                .order_by(self.runs.c.created_at.desc())
+            ).mappings().first()
+        return dict(row) if row else None
 
     def ingest_document(
         self,
@@ -407,13 +600,31 @@ class Database:
         external_agent_catalog_file: Path | None = None,
     ) -> None:
         self.reset_demo_data()
+        demo_workspace_root = workspace_root / "demo"
+        if demo_workspace_root.exists():
+            shutil.rmtree(demo_workspace_root)
+        catalog_file = external_agent_catalog_file or (
+            project_root / "data" / "external_agents" / "catalog.json"
+        )
+        if catalog_file.exists():
+            catalog_file.unlink()
+        self.ensure_demo_seed_data(project_root, workspace_root, catalog_file, force_reset_catalog=True)
+
+    def ensure_demo_seed_data(
+        self,
+        project_root: Path,
+        workspace_root: Path,
+        external_agent_catalog_file: Path | None = None,
+        *,
+        force_reset_catalog: bool = False,
+    ) -> None:
         demo_users = [
             AuthenticatedUser(
                 tenant_id="demo",
                 user_id="alice",
                 display_name="Alice Chen",
                 role="manager",
-                project_ids=["alpha"],
+                project_ids=["alpha", "beta"],
                 default_project_id="alpha",
             ),
             AuthenticatedUser(
@@ -423,6 +634,14 @@ class Database:
                 role="tester",
                 project_ids=["beta"],
                 default_project_id="beta",
+            ),
+            AuthenticatedUser(
+                tenant_id="demo",
+                user_id="charlie",
+                display_name="Charlie Wang",
+                role="analyst",
+                project_ids=["alpha"],
+                default_project_id="alpha",
             ),
         ]
         for user in demo_users:
@@ -456,6 +675,9 @@ class Database:
             },
         ]
         for spec in doc_specs:
+            source_path = str(spec["path"].relative_to(project_root))
+            if self.has_content_source(source_path):
+                continue
             self.ingest_document(
                 tenant_id="demo",
                 scope_type=spec["scope_type"],
@@ -463,7 +685,7 @@ class Database:
                 owner_user_id=spec["owner_user_id"],
                 project_id=spec["project_id"],
                 title=spec["title"],
-                source_path=str(spec["path"].relative_to(project_root)),
+                source_path=source_path,
                 body_text=spec["path"].read_text(encoding="utf-8"),
                 metadata={
                     "tenant_id": "demo",
@@ -486,6 +708,11 @@ class Database:
                 "drafts/test-focus.txt": (
                     "优先验证登录隔离、知识过滤、MCP 文件读取、审计链路。"
                 ),
+                "notes/beta-handoff.md": (
+                    "# Beta 试点切换说明\n\n"
+                    "- Alice 也参与 beta 项目的跨团队沟通。\n"
+                    "- 需要验证同一用户切换到 beta 项目时，知识命中会转到 beta 范围。"
+                ),
             },
             "bob": {
                 "notes/beta-todo.md": (
@@ -494,12 +721,29 @@ class Database:
                     "- 补充接口超时告警阈值。\n"
                     "- Beta 项目不要暴露给 Alpha 用户。"
                 ),
+                "notes/release-checklist.md": (
+                    "# Beta 发布检查\n\n"
+                    "- 重点回归 beta 的接口超时与日志告警。\n"
+                    "- 不需要 alpha 项目的任何个人文件。"
+                ),
+            },
+            "charlie": {
+                "notes/alpha-analysis.md": (
+                    "# Alpha 分析视角\n\n"
+                    "- Charlie 关注 alpha 项目的指标拆解与知识验证。\n"
+                    "- 需要验证同一 alpha 项目下，不同用户能命中相同项目知识但不同个人知识。"
+                ),
             },
         }
         for user_id, files in personal_notes.items():
             user_root = ensure_workspace(workspace_root / "demo" / user_id)
             for rel_path, content in files.items():
-                save_text_file(user_root, rel_path, content, overwrite=True)
+                absolute_path = user_root / rel_path
+                if not absolute_path.exists():
+                    save_text_file(user_root, rel_path, content, overwrite=True)
+                source_path = f"workspace/{user_id}/{rel_path}"
+                if self.has_content_source(source_path):
+                    continue
                 self.ingest_document(
                     tenant_id="demo",
                     scope_type="personal",
@@ -507,8 +751,8 @@ class Database:
                     owner_user_id=user_id,
                     project_id=None,
                     title=f"{user_id}::{rel_path}",
-                    source_path=f"workspace/{user_id}/{rel_path}",
-                    body_text=content,
+                    source_path=source_path,
+                    body_text=absolute_path.read_text(encoding="utf-8"),
                     metadata={
                         "tenant_id": "demo",
                         "scope_type": "personal",
@@ -521,7 +765,7 @@ class Database:
         catalog_file = external_agent_catalog_file or (
             project_root / "data" / "external_agents" / "catalog.json"
         )
-        self.ensure_demo_external_agent_catalog(catalog_file)
+        self.ensure_demo_external_agent_catalog(catalog_file, overwrite=force_reset_catalog)
 
     def provision_codex_bridge_user(
         self,
@@ -568,8 +812,10 @@ class Database:
                 },
             )
 
-    def ensure_demo_external_agent_catalog(self, catalog_file: Path) -> None:
+    def ensure_demo_external_agent_catalog(self, catalog_file: Path, *, overwrite: bool = False) -> None:
         catalog_file.parent.mkdir(parents=True, exist_ok=True)
+        if catalog_file.exists() and not overwrite:
+            return
         catalog_file.write_text(
             json.dumps(
                 {
@@ -735,6 +981,42 @@ class Database:
             payload={"project_id": ctx.project_id, "agent_id": agent_id, **payload},
         )
 
+    def record_member_output(
+        self,
+        ctx: RequestContext,
+        *,
+        member_name: str,
+        order: int,
+        content: str,
+        phase: str = "team",
+    ) -> None:
+        self.append_audit(
+            trace_id=ctx.trace_id,
+            request_id=ctx.request_id,
+            session_id=ctx.session_id,
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            event_type="member_output_captured",
+            payload={
+                "project_id": ctx.project_id,
+                "member_name": member_name,
+                "order": order,
+                "phase": phase,
+                "content": content,
+            },
+        )
+
+    def record_prefetch_triggered(self, ctx: RequestContext, *, payload: dict) -> None:
+        self.append_audit(
+            trace_id=ctx.trace_id,
+            request_id=ctx.request_id,
+            session_id=ctx.session_id,
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            event_type="prefetch_triggered",
+            payload={"project_id": ctx.project_id, **payload},
+        )
+
 
 def chunk_text(text: str, target_size: int = 500) -> list[str]:
     parts = [part.strip() for part in text.split("\n\n") if part.strip()]
@@ -784,7 +1066,7 @@ def write_mcp_audit_log(
                 user_id,
                 event_type,
                 json.dumps(payload, ensure_ascii=False),
-                utcnow().isoformat(),
+                sqlite_timestamp(),
             ),
         )
         conn.commit()

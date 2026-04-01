@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     external_agent_catalog_file: Path = Field(default=Path("data/external_agents/catalog.json"))
     external_agent_base_url: str = "http://127.0.0.1:7777"
     skills_root: Path = Field(default=Path("skills"))
+    codex_safe_cwd_root: Path = Field(default=Path("data/codex_sandbox"))
+    external_prefetch_enabled: bool = True
+    external_prefetch_mode: str = "prefetch"
+    mcp_allow_write: bool = True
 
     allow_mock_fallback: bool = True
     telemetry_enabled: bool = False
@@ -108,6 +112,10 @@ class Settings(BaseSettings):
     @property
     def resolved_skills_root(self) -> Path:
         return (self.project_root / self.skills_root).resolve()
+
+    @property
+    def resolved_codex_safe_cwd_root(self) -> Path:
+        return (self.project_root / self.codex_safe_cwd_root).resolve()
 
     @property
     def codex_bridge_project_ids_list(self) -> list[str]:

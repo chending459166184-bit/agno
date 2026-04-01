@@ -8,6 +8,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
+from app.agent_configs import AgentConfigService
 from app.auth import decode_token, issue_demo_token, read_codex_bridge_user
 from app.config import Settings, get_settings
 from app.context import AuthenticatedUser, RequestContext
@@ -18,9 +19,12 @@ from app.external_agents import (
     ExternalAgentDiscovery,
     ExternalAgentRegistry,
 )
+from app.debug_ui import render_debug_page
 from app.model_gateway import LiteLLMHealthChecker, ModelRegistry, ModelRouter
 from app.runtime import OrchestratorRuntime
-from app.workspace import list_files
+from app.trace_view import build_trace_summary
+from app.workspace import list_files, read_text_file, save_text_file
+from app.workspace_mcp import call_workspace_mcp_tool
 
 
 class ChatRequest(BaseModel):
@@ -47,26 +51,61 @@ class ExternalAgentInvokeRequest(BaseModel):
     metadata: dict | None = None
 
 
+class WorkspaceMcpListRequest(BaseModel):
+    project_id: str | None = None
+    session_id: str | None = None
+    prefix: str = ""
+    limit: int = 50
+
+
+class WorkspaceMcpReadRequest(BaseModel):
+    project_id: str | None = None
+    session_id: str | None = None
+    path: str
+    max_chars: int = 6000
+
+
+class WorkspaceMcpWriteRequest(BaseModel):
+    project_id: str | None = None
+    session_id: str | None = None
+    path: str
+    content: str
+    overwrite: bool = True
+
+
+class WorkspaceFileWriteRequest(BaseModel):
+    path: str
+    content: str
+    overwrite: bool = True
+
+
+class AgentConfigUpdateRequest(BaseModel):
+    project_id: str | None = None
+    enabled: bool | None = None
+    priority: int | None = None
+    allow_auto_route: bool | None = None
+    preferred_model_alias: str | None = None
+    note: str | None = None
+    config_json: dict | None = None
+
+
 class AppServices:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.database = Database(settings.resolved_db_file)
         self.database.init_schema()
-        if not self.database.list_users():
-            self.database.seed_demo_data(
-                settings.project_root,
-                settings.resolved_workspace_root,
-                settings.resolved_external_agent_catalog_file,
-            )
-        else:
-            self.database.ensure_demo_external_agent_catalog(
-                settings.resolved_external_agent_catalog_file
-            )
+        self.database.ensure_demo_seed_data(
+            settings.project_root,
+            settings.resolved_workspace_root,
+            settings.resolved_external_agent_catalog_file,
+        )
         self.model_registry = ModelRegistry(settings)
         self.model_router = ModelRouter(self.model_registry)
         self.health_checker = LiteLLMHealthChecker(settings, self.model_registry)
         self.external_discovery = ExternalAgentDiscovery(settings)
         self.external_registry = ExternalAgentRegistry(self.external_discovery)
+        self.agent_config_service = AgentConfigService(self.database, self.model_registry)
+        self.agent_config_service.ensure_defaults()
         self.a2a_client = A2AClient(settings, self.external_discovery.config.default_a2a)
         self.external_broker = ExternalAgentBroker(
             settings,
@@ -80,6 +119,7 @@ class AppServices:
             self.model_router,
             self.health_checker,
             self.external_broker,
+            self.agent_config_service,
         )
 
     def build_context(
@@ -548,7 +588,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @base_app.get("/debug", response_class=HTMLResponse)
     def index() -> str:
-        return render_index()
+        return render_debug_page()
 
     @base_app.get("/gateway/dev-token/{user_id}")
     def create_dev_token(user_id: str, svc: AppServices = Depends(get_services)) -> dict:
@@ -565,6 +605,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         token = issue_demo_token(svc.settings, user)
         return {"token": token, "user": user.user_id, "project_ids": user.project_ids}
+
+    @base_app.get("/gateway/dev-users")
+    def dev_users(svc: AppServices = Depends(get_services)) -> dict:
+        users = []
+        for row in svc.database.list_users():
+            users.append(
+                {
+                    "tenant_id": row["tenant_id"],
+                    "user_id": row["user_id"],
+                    "display_name": row["display_name"],
+                    "role": row["role"],
+                    "project_ids": list(row["project_ids_json"]),
+                    "default_project_id": row["default_project_id"],
+                }
+            )
+        users.sort(key=lambda item: item["user_id"])
+        return {"users": users}
 
     @base_app.get("/gateway/codex-status")
     def codex_status(svc: AppServices = Depends(get_services)) -> dict:
@@ -601,6 +658,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload.update(
             {
                 "allow_mock_fallback": svc.settings.allow_mock_fallback,
+                "mcp_allow_write": svc.settings.mcp_allow_write,
+                "external_prefetch": {
+                    "enabled": svc.settings.external_prefetch_enabled,
+                    "mode": svc.settings.external_prefetch_mode,
+                },
                 "router_defaults": svc.model_registry.default_aliases_by_task(),
                 "external_agents": svc.external_registry.status(),
             }
@@ -668,6 +730,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "display_name": user.display_name,
             "role": user.role,
             "project_ids": user.project_ids,
+            "default_project_id": user.default_project_id,
         }
 
     @base_app.get("/gateway/workspace")
@@ -679,7 +742,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {
             "user_id": user.user_id,
             "root": str(root),
+            "mode": "direct_view",
+            "note": "这是 direct view，用于直接查看当前用户空间；它不是 Workspace Agent 通过 MCP 调用的证明。",
             "files": list_files(root, limit=20),
+        }
+
+    @base_app.get("/gateway/workspace/file")
+    def workspace_file_read(
+        path: str = Query(..., min_length=1),
+        user: AuthenticatedUser = Depends(get_current_user),
+        svc: AppServices = Depends(get_services),
+    ) -> dict:
+        root = svc.settings.resolved_workspace_root / user.tenant_id / user.user_id
+        data = read_text_file(root, path)
+        return {
+            "user_id": user.user_id,
+            "root": str(root),
+            "mode": "direct_view",
+            "note": "这是 direct debug 读取，不代表 Workspace Agent 的 MCP 调用。",
+            **data,
+        }
+
+    @base_app.post("/gateway/workspace/file")
+    def workspace_file_write(
+        body: WorkspaceFileWriteRequest,
+        user: AuthenticatedUser = Depends(get_current_user),
+        svc: AppServices = Depends(get_services),
+    ) -> dict:
+        root = svc.settings.resolved_workspace_root / user.tenant_id / user.user_id
+        data = save_text_file(root, body.path, body.content, overwrite=body.overwrite)
+        return {
+            "user_id": user.user_id,
+            "root": str(root),
+            "mode": "direct_view",
+            "note": "这是 direct debug 写入，不代表 Workspace Agent 的 MCP 调用；真正的 MCP 验证请看 workspace-mcp/* 接口。",
+            **data,
         }
 
     @base_app.get("/gateway/knowledge")
@@ -696,7 +793,84 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             project_id=ctx.project_id,
             query=q,
         )
-        return {"trace_id": ctx.trace_id, "hits": hits}
+        return {
+            "trace_id": ctx.trace_id,
+            "tenant_id": ctx.tenant_id,
+            "user_id": ctx.user_id,
+            "project_id": ctx.project_id,
+            "query": q,
+            "hit_count": len(hits),
+            "hits": hits,
+        }
+
+    @base_app.post("/gateway/debug/workspace-mcp/list")
+    def workspace_mcp_list(
+        body: WorkspaceMcpListRequest,
+        user: AuthenticatedUser = Depends(get_current_user),
+        svc: AppServices = Depends(get_services),
+    ) -> dict:
+        ctx = svc.build_context(user=user, project_id=body.project_id, session_id=body.session_id)
+        data = call_workspace_mcp_tool(
+            svc.settings,
+            ctx,
+            "workspace_list_files",
+            {"prefix": body.prefix, "limit": body.limit},
+        )
+        return {
+            "trace_id": ctx.trace_id,
+            "request_id": ctx.request_id,
+            "session_id": ctx.session_id,
+            "tenant_id": ctx.tenant_id,
+            "user_id": ctx.user_id,
+            "project_id": ctx.project_id,
+            **data,
+        }
+
+    @base_app.post("/gateway/debug/workspace-mcp/read")
+    def workspace_mcp_read(
+        body: WorkspaceMcpReadRequest,
+        user: AuthenticatedUser = Depends(get_current_user),
+        svc: AppServices = Depends(get_services),
+    ) -> dict:
+        ctx = svc.build_context(user=user, project_id=body.project_id, session_id=body.session_id)
+        data = call_workspace_mcp_tool(
+            svc.settings,
+            ctx,
+            "workspace_read_text_file",
+            {"path": body.path, "max_chars": body.max_chars},
+        )
+        return {
+            "trace_id": ctx.trace_id,
+            "request_id": ctx.request_id,
+            "session_id": ctx.session_id,
+            "tenant_id": ctx.tenant_id,
+            "user_id": ctx.user_id,
+            "project_id": ctx.project_id,
+            **data,
+        }
+
+    @base_app.post("/gateway/debug/workspace-mcp/write")
+    def workspace_mcp_write(
+        body: WorkspaceMcpWriteRequest,
+        user: AuthenticatedUser = Depends(get_current_user),
+        svc: AppServices = Depends(get_services),
+    ) -> dict:
+        ctx = svc.build_context(user=user, project_id=body.project_id, session_id=body.session_id)
+        data = call_workspace_mcp_tool(
+            svc.settings,
+            ctx,
+            "workspace_save_text_file",
+            {"path": body.path, "content": body.content, "overwrite": body.overwrite},
+        )
+        return {
+            "trace_id": ctx.trace_id,
+            "request_id": ctx.request_id,
+            "session_id": ctx.session_id,
+            "tenant_id": ctx.tenant_id,
+            "user_id": ctx.user_id,
+            "project_id": ctx.project_id,
+            **data,
+        }
 
     @base_app.get("/gateway/external-agents")
     def external_agents(
@@ -779,6 +953,97 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @base_app.get("/gateway/audit/{trace_id}")
     def trace_audit(trace_id: str, svc: AppServices = Depends(get_services)) -> dict:
         return {"trace_id": trace_id, "events": svc.database.list_audit_events(trace_id)}
+
+    @base_app.get("/gateway/trace/{trace_id}/summary")
+    def trace_summary(trace_id: str, svc: AppServices = Depends(get_services)) -> dict:
+        return build_trace_summary(svc.database, trace_id)
+
+    @base_app.get("/gateway/agent-catalog")
+    def agent_catalog(svc: AppServices = Depends(get_services)) -> dict:
+        return {"items": svc.agent_config_service.list_catalog()}
+
+    @base_app.get("/gateway/agent-configs")
+    def agent_configs(
+        user: AuthenticatedUser = Depends(get_current_user),
+        svc: AppServices = Depends(get_services),
+    ) -> dict:
+        return {
+            "tenant_id": user.tenant_id,
+            "user_id": user.user_id,
+            "bindings": svc.agent_config_service.list_bindings(
+                tenant_id=user.tenant_id,
+                user_id=user.user_id,
+            ),
+        }
+
+    @base_app.get("/gateway/agent-configs/effective")
+    def effective_agent_configs(
+        project_id: str | None = Query(default=None),
+        user: AuthenticatedUser = Depends(get_current_user),
+        svc: AppServices = Depends(get_services),
+    ) -> dict:
+        ctx = svc.build_context(user=user, project_id=project_id, session_id=None)
+        items = [
+            item.as_dict()
+            for item in svc.agent_config_service.get_effective_configs(
+                tenant_id=ctx.tenant_id,
+                user_id=ctx.user_id,
+                project_id=ctx.project_id,
+            )
+        ]
+        return {
+            "tenant_id": ctx.tenant_id,
+            "user_id": ctx.user_id,
+            "project_id": ctx.project_id,
+            "items": items,
+        }
+
+    @base_app.put("/gateway/agent-configs/{agent_key}")
+    def update_agent_config(
+        agent_key: str,
+        body: AgentConfigUpdateRequest,
+        user: AuthenticatedUser = Depends(get_current_user),
+        svc: AppServices = Depends(get_services),
+    ) -> dict:
+        ctx = svc.build_context(user=user, project_id=body.project_id, session_id=None)
+        try:
+            binding = svc.agent_config_service.update_binding(
+                ctx,
+                agent_key=agent_key,
+                project_id=body.project_id,
+                enabled=body.enabled,
+                priority=body.priority,
+                allow_auto_route=body.allow_auto_route,
+                preferred_model_alias=body.preferred_model_alias,
+                note=body.note,
+                config_json=body.config_json,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "tenant_id": ctx.tenant_id,
+            "user_id": ctx.user_id,
+            "project_id": body.project_id,
+            "binding": binding,
+        }
+
+    @base_app.delete("/gateway/agent-configs/{agent_key}")
+    def delete_agent_config(
+        agent_key: str,
+        project_id: str | None = Query(default=None),
+        user: AuthenticatedUser = Depends(get_current_user),
+        svc: AppServices = Depends(get_services),
+    ) -> dict:
+        try:
+            svc.agent_config_service.delete_binding(
+                tenant_id=user.tenant_id,
+                user_id=user.user_id,
+                agent_key=agent_key,
+                project_id=project_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, "agent_key": agent_key, "project_id": project_id}
 
     @base_app.get("/demo-a2a/agents/{agent_id}/.well-known/agent-card.json")
     def demo_external_agent_card(
@@ -869,6 +1134,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             payload={"project_id": ctx.project_id, "message": body.message},
         )
         result = svc.runtime.run(ctx, body.message, use_mock=body.use_mock)
+        if result.mode == "mock":
+            for index, item in enumerate(result.member_outputs, start=1):
+                svc.database.record_member_output(
+                    ctx,
+                    member_name=item["name"],
+                    order=index,
+                    content=item["content"],
+                    phase=item.get("phase", "mock"),
+                )
         run_id = svc.database.create_run(
             ctx=ctx,
             input_text=body.message,
@@ -889,9 +1163,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "mode": result.mode,
                 "selected_agents": result.selected_agents,
                 "knowledge_hit_count": len(result.knowledge_hits),
+                "knowledge_hits": result.knowledge_hits,
                 "model_routes": result.model_routes,
+                "prefetch_info": result.prefetch_info,
+                "effective_agents": result.effective_agents,
             },
         )
+        summary = build_trace_summary(svc.database, ctx.trace_id)
         return {
             "answer": result.answer,
             "mode": result.mode,
@@ -903,10 +1181,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "user_id": ctx.user_id,
             "project_id": ctx.project_id,
             "workspace_root": str(ctx.workspace_root),
+            "selected_agents": result.selected_agents,
+            "prefetch_info": result.prefetch_info,
+            "effective_agents": result.effective_agents,
             "knowledge_hits": result.knowledge_hits,
             "member_outputs": result.member_outputs,
             "model_routes": result.model_routes,
             "notes": result.notes,
+            "trace_summary": summary,
         }
 
     default_team = services.runtime.build_default_team(settings.project_root)

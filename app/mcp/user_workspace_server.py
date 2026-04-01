@@ -42,23 +42,24 @@ def audit(tool_name: str, payload: dict[str, Any]) -> None:
 def workspace_list_files(prefix: str = "", limit: int = 50) -> dict[str, Any]:
     files = list_files(WORKSPACE_ROOT, prefix=prefix, limit=limit)
     audit("workspace_list_files", {"prefix": prefix, "count": len(files)})
-    return {"ok": True, "root": str(WORKSPACE_ROOT), "files": files}
+    return {"ok": True, "root": str(WORKSPACE_ROOT), "files": files, "allow_write": MCP_ALLOW_WRITE}
 
 
 @mcp.tool()
 def workspace_read_text_file(path: str, max_chars: int = 6000) -> dict[str, Any]:
     data = read_text_file(WORKSPACE_ROOT, path, max_chars=max_chars)
     audit("workspace_read_text_file", {"path": path, "truncated": data["truncated"]})
-    return {"ok": True, **data}
+    return {"ok": True, "allow_write": MCP_ALLOW_WRITE, **data}
 
 
 @mcp.tool()
 def workspace_save_text_file(path: str, content: str, overwrite: bool = True) -> dict[str, Any]:
     if not MCP_ALLOW_WRITE:
+        audit("workspace_save_text_file", {"path": path, "blocked": True})
         raise ValueError("当前 PoC 默认关闭写入，如需启用请设置 MCP_ALLOW_WRITE=true")
     data = save_text_file(WORKSPACE_ROOT, path, content, overwrite=overwrite)
     audit("workspace_save_text_file", {"path": path, "size": data["size"]})
-    return {"ok": True, **data}
+    return {"ok": True, "allow_write": MCP_ALLOW_WRITE, **data}
 
 
 if __name__ == "__main__":
