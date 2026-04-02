@@ -922,19 +922,61 @@ def render_debug_page() -> str:
       function renderTraceTimeline(summary) {
         setOutput("traceOutput", summary);
         const container = $("traceTimeline");
+        const escapeHtml = (value) => String(value ?? "")
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;");
+        const renderJson = (value) => escapeHtml(JSON.stringify(value, null, 2));
+        const orchestration = summary.orchestration || {};
+        const steps = orchestration.steps || [];
         const items = summary.audit_timeline || [];
-        if (!items.length) {
+        if (!items.length && !steps.length) {
           container.innerHTML = "";
           return;
         }
-        container.innerHTML = items.map((item) => `
+        const summaryCard = `
           <div class="timeline-item">
-            <strong>${item.title}</strong>
-            <div class="mini">${item.timestamp} | ${item.event_type}</div>
-            ${item.payload?.phase ? `<div class="mini">phase=${item.payload.phase}</div>` : ""}
-            <div style="margin-top:8px;">${item.summary}</div>
+            <strong>Orchestration Summary</strong>
+            <div class="mini">
+              mode=${escapeHtml(summary.run?.mode || "n/a")} |
+              iterations=${escapeHtml(orchestration.iteration_count || 0)} |
+              stop_reason=${escapeHtml(orchestration.stop_reason || "n/a")}
+            </div>
+            <div style="margin-top:8px;">
+              selected_agents=${escapeHtml((summary.run?.selected_agents || []).join(", ") || "none")}
+            </div>
+          </div>
+        `;
+        const stepCards = steps.map((step) => `
+          <div class="timeline-item">
+            <strong>Round ${escapeHtml(step.iteration || 0)} · ${escapeHtml(step.step_type || step.phase || "step")}</strong>
+            <div class="mini">
+              actor=${escapeHtml(step.name || "unknown")}
+              ${step.target_agent ? ` | target=${escapeHtml(step.target_agent)}` : ""}
+              ${step.status ? ` | status=${escapeHtml(step.status)}` : ""}
+              ${step.stop_reason ? ` | stop=${escapeHtml(step.stop_reason)}` : ""}
+            </div>
+            ${step.tool_evidence?.length ? `<div class="mini">tools=${escapeHtml(step.tool_evidence.join(", "))}</div>` : ""}
+            ${step.reason_code ? `<div class="mini">reason_code=${escapeHtml(step.reason_code)}</div>` : ""}
+            ${step.detected_intent ? `<div class="mini">intent=${escapeHtml(step.detected_intent)}</div>` : ""}
+            ${step.resolved_relative_path ? `<div class="mini">resolved_path=${escapeHtml(step.resolved_relative_path)}</div>` : ""}
+            ${step.next_action_suggestion ? `<div class="mini">next=${escapeHtml(step.next_action_suggestion)}</div>` : ""}
+            ${step.used_default_path ? `<div class="mini">used_default_path=true</div>` : ""}
+            ${step.delegate_payload ? `<pre class="mini" style="margin-top:8px; white-space:pre-wrap;">delegate_payload=${renderJson(step.delegate_payload)}</pre>` : ""}
+            ${step.tool_calls ? `<pre class="mini" style="margin-top:8px; white-space:pre-wrap;">tool_calls=${renderJson(step.tool_calls)}</pre>` : ""}
+            <div style="margin-top:8px;">${escapeHtml(step.content || "")}</div>
           </div>
         `).join("");
+        const auditCards = items.map((item) => `
+          <div class="timeline-item">
+            <strong>${escapeHtml(item.title)}</strong>
+            <div class="mini">${escapeHtml(item.timestamp)} | ${escapeHtml(item.event_type)}</div>
+            ${item.payload?.phase ? `<div class="mini">phase=${escapeHtml(item.payload.phase)}</div>` : ""}
+            ${item.payload?.iteration ? `<div class="mini">iteration=${escapeHtml(item.payload.iteration)}</div>` : ""}
+            <div style="margin-top:8px;">${escapeHtml(item.summary)}</div>
+          </div>
+        `).join("");
+        container.innerHTML = [summaryCard, stepCards, auditCards].filter(Boolean).join("");
       }
 
       async function loadTraceSummary(traceId = "", switchTab = true) {

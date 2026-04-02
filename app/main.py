@@ -1294,6 +1294,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "model_routes": result.model_routes,
                 "prefetch_info": result.prefetch_info,
                 "effective_agents": result.effective_agents,
+                "iteration_count": result.iteration_count,
+                "stop_reason": result.stop_reason,
             },
         )
         summary = build_trace_summary(svc.database, ctx.trace_id)
@@ -1315,6 +1317,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "member_outputs": result.member_outputs,
             "model_routes": result.model_routes,
             "notes": result.notes,
+            "iteration_count": result.iteration_count,
+            "stop_reason": result.stop_reason,
+            "orchestration_steps": result.orchestration_steps,
             "trace_summary": summary,
         }
 

@@ -1161,7 +1161,17 @@ class Database:
         order: int,
         content: str,
         phase: str = "team",
+        metadata: dict | None = None,
     ) -> None:
+        payload = {
+            "project_id": ctx.project_id,
+            "member_name": member_name,
+            "order": order,
+            "phase": phase,
+            "content": content,
+        }
+        if metadata:
+            payload.update(metadata)
         self.append_audit(
             trace_id=ctx.trace_id,
             request_id=ctx.request_id,
@@ -1169,13 +1179,7 @@ class Database:
             tenant_id=ctx.tenant_id,
             user_id=ctx.user_id,
             event_type="member_output_captured",
-            payload={
-                "project_id": ctx.project_id,
-                "member_name": member_name,
-                "order": order,
-                "phase": phase,
-                "content": content,
-            },
+            payload=payload,
         )
 
     def record_prefetch_triggered(self, ctx: RequestContext, *, payload: dict) -> None:

@@ -46,15 +46,24 @@ def _summary_for_event(event_type: str, payload: dict[str, Any]) -> str:
         return str(payload.get("message") or "")[:120]
     if event_type == "gateway_response":
         selected = ", ".join(payload.get("selected_agents") or [])
-        return f"mode={payload.get('mode')} | agents={selected or 'none'}"
+        return (
+            f"mode={payload.get('mode')} | iterations={payload.get('iteration_count') or 0} "
+            f"| stop={payload.get('stop_reason') or 'n/a'} | agents={selected or 'none'}"
+        )
     if event_type == "prefetch_triggered":
         return (
             f"mode={payload.get('mode')} | triggered={payload.get('triggered')} "
             f"| category={payload.get('category') or 'n/a'}"
         )
     if event_type == "member_output_captured":
+        iteration = payload.get("iteration")
+        target = payload.get("target_agent")
+        stop_reason = payload.get("stop_reason")
+        prefix = f"iter={iteration} | " if iteration else ""
+        target_text = f" | target={target}" if target else ""
+        stop_text = f" | stop={stop_reason}" if stop_reason else ""
         return (
-            f"{payload.get('member_name')} | phase={payload.get('phase')}: "
+            f"{prefix}{payload.get('member_name')} | phase={payload.get('phase')}{target_text}{stop_text}: "
             f"{str(payload.get('content') or '')[:120]}"
         )
     if event_type == "mcp_tool_call":
@@ -112,11 +121,36 @@ def build_trace_summary(database: Database, trace_id: str) -> dict[str, Any]:
             "order": item["payload_json"].get("order", 0),
             "phase": item["payload_json"].get("phase", "team"),
             "content": item["payload_json"].get("content", ""),
+            **{
+                key: item["payload_json"].get(key)
+                for key in (
+                    "iteration",
+                    "target_agent",
+                    "status",
+                    "step_type",
+                    "stop_reason",
+                    "tool_evidence",
+                    "reason_code",
+                    "detected_intent",
+                    "resolved_relative_path",
+                    "next_action_suggestion",
+                    "delegate_payload",
+                    "payload_signature",
+                    "tool_calls",
+                    "used_default_path",
+                )
+                if item["payload_json"].get(key) is not None
+            },
         }
         for item in events
         if item["event_type"] == "member_output_captured"
     ]
     member_outputs.sort(key=lambda item: (item["order"], item["name"] or ""))
+    orchestration_steps = [
+        dict(item)
+        for item in member_outputs
+        if item.get("phase") in {"plan", "decision", "delegate", "observe", "finalize", "gate_block", "prefetch"}
+    ]
 
     timeline = []
     for item in events:
@@ -151,6 +185,13 @@ def build_trace_summary(database: Database, trace_id: str) -> dict[str, Any]:
             or (run["selected_agents_json"] if run else []),
             "effective_agents": response_payload.get("effective_agents") or [],
             "model_routes": response_payload.get("model_routes") or {},
+            "iteration_count": response_payload.get("iteration_count") or 0,
+            "stop_reason": response_payload.get("stop_reason"),
+        },
+        "orchestration": {
+            "iteration_count": response_payload.get("iteration_count") or 0,
+            "stop_reason": response_payload.get("stop_reason"),
+            "steps": orchestration_steps,
         },
         "prefetch_info": response_payload.get("prefetch_info") or {},
         "knowledge_hits": response_payload.get("knowledge_hits") or [],

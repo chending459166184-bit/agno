@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import re
 import sys
+from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from agno.agent import Agent
@@ -15,6 +16,7 @@ from agno.skills import LocalSkills, Skills
 from agno.team import Team
 from agno.team.mode import TeamMode
 from agno.tools.mcp import MCPTools
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.agent_configs import AgentConfigService, EffectiveAgentConfig
 from app.config import Settings
@@ -47,6 +49,9 @@ class RunResult:
     model_routes: dict[str, str] = field(default_factory=dict)
     prefetch_info: dict = field(default_factory=dict)
     effective_agents: list[dict] = field(default_factory=list)
+    iteration_count: int = 0
+    stop_reason: str | None = None
+    orchestration_steps: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -54,6 +59,52 @@ class TeamRoutingPlan:
     required_agents: list[str] = field(default_factory=list)
     hints: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+
+
+class OrchestratorDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["delegate", "finalize"] = Field(
+        description="本轮是继续委托子智能体，还是直接给最终用户答复。"
+    )
+    rationale: str = Field(
+        default="",
+        description="对当前动作的简洁理由；如果模型未提供，runtime 会自动补默认值。",
+    )
+    target_agent: str | None = Field(
+        default=None,
+        description="当 action=delegate 时要委托的子智能体名称。",
+    )
+    delegate_instruction: str | None = Field(
+        default=None,
+        description="给子智能体的本轮任务说明。",
+    )
+    final_answer: str | None = Field(
+        default=None,
+        description="当 action=finalize 时给最终用户的答复。",
+    )
+    stop_reason: str | None = Field(
+        default=None,
+        description="当 action=finalize 时结束原因，例如 direct_response 或 sufficient_evidence。",
+    )
+
+
+class WorkspaceTaskPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    detected_intent: Literal["list_files", "read_file", "write_file", "unknown"] = "unknown"
+    action: Literal["list_files", "read_file", "write_file", "needs_clarification", "policy_blocked"] = (
+        "needs_clarification"
+    )
+    rationale: str = ""
+    reason_code: str = "unspecified"
+    resolved_relative_path: str | None = None
+    extracted_content: str | None = None
+    directory_prefix: str | None = None
+    clarification_question: str | None = None
+    next_action_suggestion: str | None = None
+    overwrite: bool = True
+    used_default_path: bool = False
 
 class OrchestratorRuntime:
     def __init__(
@@ -258,6 +309,522 @@ class OrchestratorRuntime:
         hints = " | ".join(routing_plan.hints[:3]) if routing_plan.hints else "none"
         return f"required_agents={required}; hints={hints}"
 
+    def _max_orchestration_iterations(self, member_agents: dict[str, Agent]) -> int:
+        configured = int(getattr(self.settings, "orchestrator_max_iterations", 6) or 6)
+        dynamic_floor = max(3, len(member_agents) + 1)
+        return max(configured, dynamic_floor)
+
+    def _make_orchestration_step(
+        self,
+        *,
+        name: str,
+        phase: str,
+        content: str,
+        iteration: int = 0,
+        target_agent: str | None = None,
+        status: str = "completed",
+        step_type: str | None = None,
+        stop_reason: str | None = None,
+        tool_evidence: list[str] | None = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        item: dict[str, Any] = {
+            "name": name,
+            "phase": phase,
+            "content": content,
+            "status": status,
+            "step_type": step_type or phase,
+        }
+        if iteration > 0:
+            item["iteration"] = iteration
+        if target_agent:
+            item["target_agent"] = target_agent
+        if stop_reason:
+            item["stop_reason"] = stop_reason
+        if tool_evidence:
+            item["tool_evidence"] = list(tool_evidence)
+        for key, value in extra.items():
+            if value is not None:
+                item[key] = value
+        return item
+
+    def _dedupe_knowledge_hits(self, hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        deduped: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for hit in hits:
+            marker = json.dumps(hit, ensure_ascii=False, sort_keys=True)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            deduped.append(hit)
+        return deduped
+
+    def _available_orchestration_agents(
+        self,
+        member_agents: dict[str, Agent],
+        effective_agent_payload: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        metadata_by_name = {
+            str(item.get("display_name") or ""): item
+            for item in effective_agent_payload
+            if item.get("display_name")
+        }
+        descriptors: list[dict[str, Any]] = []
+        for name, agent in member_agents.items():
+            metadata = metadata_by_name.get(name, {})
+            descriptors.append(
+                {
+                    "name": name,
+                    "role": str(getattr(agent, "role", "") or ""),
+                    "description": str(metadata.get("description") or ""),
+                    "priority": int(metadata.get("priority") or 0),
+                    "tool_summary": list(metadata.get("tool_summary") or []),
+                }
+            )
+        descriptors.sort(key=lambda item: (-item["priority"], item["name"]))
+        return descriptors
+
+    def _normalize_orchestrator_decision(self, value: Any) -> OrchestratorDecision:
+        raw: Any = value
+        if isinstance(value, str):
+            raw = json.loads(value)
+        elif hasattr(value, "model_dump"):
+            raw = value.model_dump()
+
+        decision = raw if isinstance(raw, OrchestratorDecision) else OrchestratorDecision.model_validate(raw)
+        if not str(decision.rationale or "").strip():
+            if decision.action == "delegate":
+                target = str(decision.target_agent or "").strip() or "目标子智能体"
+                decision.rationale = f"当前需要先委托 {target} 获取下一步证据。"
+            else:
+                decision.rationale = "当前证据已足够直接给出答复。"
+        return decision
+
+    def _build_orchestrator_decision_prompt(
+        self,
+        *,
+        prompt: str,
+        effective_prompt: str,
+        ctx: RequestContext,
+        routing_plan: TeamRoutingPlan,
+        available_agents: list[dict[str, Any]],
+        evidence_blocks: list[dict[str, Any]],
+        iteration: int,
+        max_iterations: int,
+        pending_required_agents: list[str],
+        retry_missing_agents: list[str] | None = None,
+    ) -> str:
+        visible_evidence = []
+        for block in evidence_blocks[-8:]:
+            visible_evidence.append(
+                {
+                    "name": block.get("name"),
+                    "phase": block.get("phase"),
+                    "content": str(block.get("content") or "")[:700],
+                    **{
+                        key: block.get(key)
+                        for key in (
+                            "status",
+                            "reason_code",
+                            "detected_intent",
+                            "resolved_relative_path",
+                            "next_action_suggestion",
+                            "tool_calls",
+                        )
+                        if block.get(key) is not None
+                    },
+                }
+            )
+        guided_prompt = self._apply_team_routing_hints(
+            effective_prompt,
+            routing_plan,
+            retry_missing_agents=retry_missing_agents,
+        )
+        return (
+            "你是 Enterprise Orchestrator 的多轮编排决策内核。\n"
+            "你的唯一职责是决定当前这一轮的下一步动作：委托哪个子智能体，或直接给最终用户答复。\n"
+            "你没有 Workspace MCP、知识检索、sandbox 执行或 A2A 的直接访问权，不能伪造这些结果。\n"
+            "只有 observe 阶段里已经拿到的证据才能当作真实事实使用。\n"
+            "你可以重复调用同一个子智能体，也可以切换到其他子智能体。\n"
+            "如果当前没有合适子智能体，或者已有证据已经足够，就选择 finalize。\n"
+            "如果仍存在 pending_required_agents，就不能 finalize，必须先补齐这些真实证据。\n\n"
+            f"轮次: {iteration}/{max_iterations}\n"
+            f"用户上下文: tenant={ctx.tenant_id}, user={ctx.user_id}, project={ctx.project_id}, role={ctx.role}\n"
+            f"用户原始请求: {prompt}\n"
+            f"编排提示后的请求: {guided_prompt}\n"
+            f"待补齐的强制证据 agent: {json.dumps(pending_required_agents, ensure_ascii=False)}\n"
+            f"可用子智能体(JSON): {json.dumps(available_agents, ensure_ascii=False)}\n"
+            f"已有证据(JSON): {json.dumps(visible_evidence, ensure_ascii=False)}\n"
+        )
+
+    def _json_signature(self, value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+    def _delegate_policy_flags(self, agent_name: str) -> dict[str, Any]:
+        if agent_name == "Workspace Agent":
+            return {
+                "allow_workspace_context_path_inference": True,
+                "allow_generated_filename": True,
+                "allow_clarification": True,
+                "allow_overwrite": True,
+                "prefer_existing_directories": True,
+                "create_new_directory_by_default": False,
+            }
+        return {"allow_clarification": True}
+
+    def _delegate_allowed_tools(self, agent_name: str, agent_descriptor: dict[str, Any] | None = None) -> list[str]:
+        explicit_map = {
+            "Knowledge Agent": ["search_project_knowledge"],
+            "Workspace Agent": [
+                "workspace_list_files",
+                "workspace_read_text_file",
+                "workspace_save_text_file",
+            ],
+            "Execution Agent": ["execute_in_sandbox"],
+            "External Agent Broker": ["list_external_agents", "delegate_to_external_agent"],
+            "Test Agent": [],
+        }
+        mapped = explicit_map.get(agent_name)
+        if mapped is not None:
+            return list(mapped)
+        return list((agent_descriptor or {}).get("tool_summary") or [])
+
+    def _default_delegate_instruction(
+        self,
+        agent_name: str | None,
+        current_instruction: str | None,
+    ) -> str:
+        current = str(current_instruction or "").strip()
+        if agent_name == "Workspace Agent":
+            if not current or "获取下一步证据" in current or current == "请处理当前最关键的下一步。":
+                return (
+                    "请基于原始用户请求自主判断是列目录、读取文件还是保存文本。"
+                    "如果用户要保存内容但没有给出相对路径，请先通过 Workspace MCP 感知当前用户空间结构，"
+                    "再推断合适的相对路径并完成真实写入；只有在关键信息仍不足时才向用户确认。"
+                )
+        return current or "请处理当前最关键的下一步。"
+
+    def _sanitize_delegate_payload_for_trace(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "original_user_message": str(payload.get("original_user_message") or "")[:500],
+            "orchestrator_goal": str(payload.get("orchestrator_goal") or "")[:300],
+            "current_iteration": payload.get("current_iteration"),
+            "tenant_id": payload.get("tenant_id"),
+            "user_id": payload.get("user_id"),
+            "project_id": payload.get("project_id"),
+            "workspace_root": payload.get("workspace_root"),
+            "allowed_tools": list(payload.get("allowed_tools") or []),
+            "agent_role": payload.get("agent_role"),
+            "safety_boundary": payload.get("safety_boundary"),
+            "policy_flags": dict(payload.get("policy_flags") or {}),
+            "prior_attempt_count": len(payload.get("prior_attempts") or []),
+            "known_evidence_count": len(payload.get("known_evidence") or []),
+        }
+
+    def _delegate_runtime_rules(
+        self,
+        agent_name: str,
+        payload: dict[str, Any],
+    ) -> list[str]:
+        base_rules = [
+            "只能在当前授权边界内行动。",
+            "不能伪造 tool_evidence 或工具返回结果。",
+            "最终结论必须基于真实工具结果，或明确的澄清/阻断状态。",
+        ]
+        policy_flags = dict(payload.get("policy_flags") or {})
+        if agent_name == "Workspace Agent":
+            base_rules.extend(
+                [
+                    "只能在 workspace_root 下读取、写入和整理文件。",
+                    "不允许把系统固定默认目录当成主策略。",
+                    "优先感知当前用户自己的工作区结构，再推断最合适的相对路径。",
+                    "如果能推断出合理路径，就直接调用真实保存工具完成写入。",
+                    "只有当路径无法从当前用户空间和请求中推出时，才返回 needs_clarification。",
+                ]
+            )
+            if not policy_flags.get("create_new_directory_by_default", False):
+                base_rules.append("没有充分证据时，不要默认创建新的目录层级。")
+        elif agent_name == "Knowledge Agent":
+            base_rules.extend(
+                [
+                    "只在当前 tenant/user/project 授权范围内检索知识。",
+                    "没有命中时要明确说明，不要脑补文档内容。",
+                ]
+            )
+        elif agent_name == "Execution Agent":
+            base_rules.extend(
+                [
+                    "只有在确实需要运行代码、脚本或命令时才执行。",
+                    "只能基于真实 sandbox 结果返回结论。",
+                ]
+            )
+        elif agent_name == "External Agent Broker":
+            base_rules.extend(
+                [
+                    "优先内部能力，只有确实需要外部能力时才做外部委托。",
+                    "只向外部 agent 暴露最小必要上下文。",
+                ]
+            )
+        return base_rules
+
+    def _build_delegate_runtime_context(
+        self,
+        *,
+        agent_name: str,
+        payload: dict[str, Any],
+    ) -> str:
+        original_user_message = str(payload.get("original_user_message") or "").strip()
+        orchestrator_goal = str(payload.get("orchestrator_goal") or "").strip()
+        known_evidence = list(payload.get("known_evidence") or [])
+        lines = [
+            f"你是 {agent_name}，负责处理当前这轮委托任务。",
+            "",
+            "当前运行上下文：",
+            f"- tenant_id: {payload.get('tenant_id') or 'unknown'}",
+            f"- user_id: {payload.get('user_id') or 'unknown'}",
+            f"- project_id: {payload.get('project_id') or 'unknown'}",
+            f"- workspace_root: {payload.get('workspace_root') or 'n/a'}",
+            f"- agent_role: {payload.get('agent_role') or 'n/a'}",
+            "",
+            "当前任务：",
+            f"- 原始用户请求：{original_user_message or 'n/a'}",
+            f"- 主智能体目标：{orchestrator_goal or 'n/a'}",
+            f"- 当前轮次：{payload.get('current_iteration') or 0}",
+        ]
+        if known_evidence:
+            lines.extend(
+                [
+                    "",
+                    "当前已知证据：",
+                    *[
+                        (
+                            f"- {item.get('name') or 'unknown'}"
+                            f" | phase={item.get('phase') or 'unknown'}"
+                            f" | status={item.get('status') or 'n/a'}"
+                            f" | content={str(item.get('content') or '')[:180]}"
+                        )
+                        for item in known_evidence[-5:]
+                    ],
+                ]
+            )
+        allowed_tools = list(payload.get("allowed_tools") or [])
+        if allowed_tools:
+            lines.extend(
+                [
+                    "",
+                    "允许使用的工具：",
+                    f"- {', '.join(allowed_tools)}",
+                ]
+            )
+        safety_boundary = str(payload.get("safety_boundary") or "").strip()
+        if safety_boundary:
+            lines.extend(
+                [
+                    "",
+                    "安全边界：",
+                    f"- {safety_boundary}",
+                ]
+            )
+        lines.extend(
+            [
+                "",
+                "你的工作规则：",
+                *[f"{index}. {rule}" for index, rule in enumerate(self._delegate_runtime_rules(agent_name, payload), start=1)],
+            ]
+        )
+        return "\n".join(lines).strip()
+
+    def _build_delegate_payload(
+        self,
+        *,
+        agent_name: str,
+        ctx: RequestContext,
+        original_user_message: str,
+        delegate_instruction: str,
+        evidence_blocks: list[dict[str, Any]],
+        iteration: int,
+        allowed_tools: list[str],
+        agent_role: str,
+        prior_attempts: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        known_evidence = [
+            {
+                "name": block.get("name"),
+                "phase": block.get("phase"),
+                "content": str(block.get("content") or "")[:500],
+                **{
+                    key: block.get(key)
+                    for key in ("status", "reason_code", "detected_intent", "resolved_relative_path")
+                    if block.get(key) is not None
+                },
+            }
+            for block in evidence_blocks[-10:]
+        ]
+        workspace_root = getattr(ctx, "workspace_root", None)
+        payload = {
+            "original_user_message": original_user_message,
+            "conversation_context": {
+                "latest_user_message": original_user_message,
+                "recent_evidence": known_evidence,
+            },
+            "orchestrator_goal": delegate_instruction,
+            "current_iteration": iteration,
+            "known_evidence": known_evidence,
+            "tenant_id": getattr(ctx, "tenant_id", ""),
+            "user_id": getattr(ctx, "user_id", ""),
+            "project_id": getattr(ctx, "project_id", ""),
+            "workspace_root": str(workspace_root) if workspace_root is not None else "",
+            "allowed_tools": allowed_tools,
+            "agent_role": agent_role,
+            "safety_boundary": (
+                "只能访问当前用户工作区；不能伪造工具结果；不能越权读取其他用户或仓库根目录；"
+                "最终结论必须基于真实工具结果或明确的澄清/阻断状态。"
+            ),
+            "policy_flags": self._delegate_policy_flags(agent_name),
+            "prior_attempts": list(prior_attempts or []),
+        }
+        payload["payload_signature"] = self._json_signature(
+            {
+                "agent_name": agent_name,
+                "original_user_message": original_user_message,
+                "orchestrator_goal": delegate_instruction,
+                "policy_flags": payload["policy_flags"],
+                "allowed_tools": allowed_tools,
+            }
+        )
+        return payload
+
+    def _serialize_delegate_payload_for_prompt(self, payload: dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def _recent_attempts_for_agent(
+        self,
+        observation_history: list[dict[str, Any]],
+        agent_name: str,
+        *,
+        limit: int = 4,
+    ) -> list[dict[str, Any]]:
+        return [dict(item) for item in observation_history if item.get("agent_name") == agent_name][-limit:]
+
+    def _repeat_failure_streak(
+        self,
+        observation_history: list[dict[str, Any]],
+        *,
+        agent_name: str,
+        reason_code: str | None,
+        payload_signature: str | None,
+    ) -> int:
+        if not reason_code or not payload_signature:
+            return 0
+        streak = 0
+        for item in reversed(observation_history):
+            if (
+                item.get("agent_name") == agent_name
+                and item.get("reason_code") == reason_code
+                and item.get("payload_signature") == payload_signature
+            ):
+                streak += 1
+                continue
+            break
+        return streak
+
+    def _fallback_orchestrator_decision(
+        self,
+        *,
+        available_agents: list[dict[str, Any]],
+        pending_required_agents: list[str],
+        notes: list[str],
+        error: Exception | None = None,
+    ) -> OrchestratorDecision:
+        available_names = [item["name"] for item in available_agents]
+        for agent_name in pending_required_agents:
+            if agent_name in available_names:
+                notes.append(f"orchestrator_decision_fallback={agent_name}")
+                return OrchestratorDecision(
+                    action="delegate",
+                    rationale="结构化决策失败，按强制证据约束回退到必需 agent。",
+                    target_agent=agent_name,
+                    delegate_instruction="请优先补齐当前缺失的真实证据，并返回可验证结果。",
+                )
+        notes.append(f"orchestrator_decision_failed={error or 'unknown_error'}")
+        return OrchestratorDecision(
+            action="finalize",
+            rationale="结构化决策失败，且当前没有可安全继续委托的必需 agent。",
+            final_answer=(
+                "当前主编排没有成功产出可验证的下一步决策，系统已停止，以避免在缺少证据时继续推断。"
+            ),
+            stop_reason="decision_error",
+        )
+
+    def _decide_orchestration_step(
+        self,
+        *,
+        ctx: RequestContext,
+        prompt: str,
+        effective_prompt: str,
+        routing_plan: TeamRoutingPlan,
+        available_agents: list[dict[str, Any]],
+        evidence_blocks: list[dict[str, Any]],
+        iteration: int,
+        max_iterations: int,
+        model: Any,
+        notes: list[str],
+        pending_required_agents: list[str],
+        retry_missing_agents: list[str] | None = None,
+    ) -> OrchestratorDecision:
+        decision_agent = Agent(
+            name="Enterprise Orchestrator",
+            role="负责多轮动态编排的主智能体，只产出结构化下一步决策",
+            model=model,
+            skills=self.orchestrator_skills,
+            db=self.agno_db,
+            telemetry=self.settings.telemetry_enabled,
+            markdown=False,
+            instructions=[
+                f"当前用户: {ctx.user_id} ({ctx.display_name})，角色: {ctx.role}。",
+                f"当前租户: {ctx.tenant_id}，当前项目: {ctx.project_id}。",
+                "严格遵守最小权限和证据优先原则。",
+                "Workspace、Knowledge、Execution、External Agent Broker 的真实结果只能来自已有 observe 证据。",
+                "如果你选择 delegate，target_agent 必须来自可用子智能体列表。",
+                "如果你选择 finalize，必须给出 final_answer 和 stop_reason。",
+                "不要输出 Markdown 或解释文字，只返回结构化结果。",
+            ],
+            additional_context=(
+                self.orchestrator_skills.get_system_prompt_snippet()
+                if self.orchestrator_skills
+                else None
+            ),
+            output_schema=OrchestratorDecision,
+            structured_outputs=True,
+            use_json_mode=True,
+        )
+        prompt_text = self._build_orchestrator_decision_prompt(
+            prompt=prompt,
+            effective_prompt=effective_prompt,
+            ctx=ctx,
+            routing_plan=routing_plan,
+            available_agents=available_agents,
+            evidence_blocks=evidence_blocks,
+            iteration=iteration,
+            max_iterations=max_iterations,
+            pending_required_agents=pending_required_agents,
+            retry_missing_agents=retry_missing_agents,
+        )
+        try:
+            response = decision_agent.run(
+                prompt_text,
+                user_id=ctx.user_id,
+                session_id=f"{ctx.session_id}:orchestrator_round_{iteration}",
+            )
+            return self._normalize_orchestrator_decision(getattr(response, "content", response))
+        except Exception as exc:
+            return self._fallback_orchestrator_decision(
+                available_agents=available_agents,
+                pending_required_agents=pending_required_agents,
+                notes=notes,
+                error=exc,
+            )
+
     def _build_agent_task_prompt(
         self,
         agent_name: str,
@@ -265,6 +832,7 @@ class OrchestratorRuntime:
         prompt: str,
         ctx: RequestContext,
         evidence_blocks: list[dict[str, Any]],
+        delegate_payload: dict[str, Any] | None = None,
     ) -> str:
         evidence_lines: list[str] = []
         for block in evidence_blocks:
@@ -272,11 +840,22 @@ class OrchestratorRuntime:
         evidence_text = "\n".join(evidence_lines) if evidence_lines else "- 当前还没有其他成员证据。"
 
         base = [
-            f"用户原始请求: {prompt}",
+            f"用户原始请求: {str((delegate_payload or {}).get('original_user_message') or prompt)}",
             f"当前租户: {ctx.tenant_id}，当前用户: {ctx.user_id}，当前项目: {ctx.project_id}",
             "已有证据:",
             evidence_text,
         ]
+        if delegate_payload:
+            base.extend(
+                [
+                    "",
+                    "[委托运行上下文]",
+                    self._build_delegate_runtime_context(
+                        agent_name=agent_name,
+                        payload=delegate_payload,
+                    ),
+                ]
+            )
         if agent_name == "Knowledge Agent":
             base.extend(
                 [
@@ -372,45 +951,474 @@ class OrchestratorRuntime:
                 lines.append(f"  - {item.get('path')}")
         return "\n".join(lines)
 
+    def _workspace_content_category(self, message: str, content: str | None = None) -> str:
+        combined = f"{message}\n{content or ''}".lower()
+        if any(keyword in combined for keyword in ["诗", "poem", "poetry", "lyric", "lyrics"]):
+            return "poem"
+        if any(keyword in combined for keyword in ["草稿", "draft"]):
+            return "draft"
+        if any(keyword in combined for keyword in ["文章", "essay", "article", "blog", "post"]):
+            return "article"
+        if any(keyword in combined for keyword in ["笔记", "note", "memo", "journal"]):
+            return "note"
+        return "text"
+
+    def _slugify_filename_seed(self, value: str) -> str:
+        candidate = re.sub(r"[^A-Za-z0-9]+", "-", str(value or "")).strip("-_.").lower()
+        candidate = re.sub(r"-{2,}", "-", candidate)
+        return candidate[:40]
+
+    def _infer_workspace_write_path(
+        self,
+        *,
+        message: str,
+        content: str,
+        workspace_files: list[dict[str, Any]],
+    ) -> tuple[str, str]:
+        category = self._workspace_content_category(message, content)
+        category_hints = {
+            "poem": ["poem", "poems", "poetry", "lyric", "lyrics", "draft", "drafts", "writing"],
+            "draft": ["draft", "drafts", "writing", "workspace"],
+            "article": ["article", "articles", "essay", "essays", "blog", "blogs", "writing", "docs"],
+            "note": ["note", "notes", "memo", "memos", "journal", "journals"],
+            "text": ["note", "notes", "draft", "drafts", "docs", "documents"],
+        }
+        parent_directories: dict[str, int] = {}
+        for item in workspace_files:
+            path = str(item.get("path") or "").strip().strip("/")
+            if "/" not in path:
+                continue
+            parent = path.rsplit("/", 1)[0]
+            parent_directories[parent] = parent_directories.get(parent, 0) + 1
+
+        best_directory = ""
+        best_score = -1
+        for directory, count in parent_directories.items():
+            base = directory.rsplit("/", 1)[-1].lower()
+            score = count
+            hints = category_hints.get(category, [])
+            if base in hints:
+                score += 8
+            elif any(hint in base for hint in hints):
+                score += 4
+            if directory.count("/") == 0:
+                score += 1
+            if score > best_score:
+                best_directory = directory
+                best_score = score
+
+        seed = ""
+        if content:
+            first_content_line = next((line.strip() for line in content.splitlines() if line.strip()), "")
+            seed = self._slugify_filename_seed(first_content_line)
+        if not seed:
+            first_message_line = next((line.strip() for line in message.splitlines() if line.strip()), "")
+            seed = self._slugify_filename_seed(first_message_line)
+        if not seed:
+            seed = category
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        filename = f"{seed}-{timestamp}.txt"
+        if best_directory:
+            return f"{best_directory}/{filename}", "write_with_inferred_workspace_path"
+        return filename, "write_with_generated_root_path"
+
+    def _heuristic_workspace_task_plan(self, delegate_payload: dict[str, Any]) -> WorkspaceTaskPlan:
+        message = str(delegate_payload.get("original_user_message") or "").strip()
+        lowered = message.lower()
+        signal = self._detect_workspace_guard(message) or {}
+        action = str(signal.get("action") or "").strip().lower()
+        path = str(signal.get("path") or "").strip() or None
+        content = str(signal.get("content") or "").strip() or None
+        policy_flags = dict(delegate_payload.get("policy_flags") or {})
+        first_line, _, rest = message.partition("\n")
+
+        if not action and any(keyword in lowered for keyword in ["保存", "写入", "save", "write"]):
+            action = "write"
+        if not content and action == "write":
+            colon_match = re.search(r"(?:下面的内容|以下内容|内容|正文|text)\s*[:：]\s*(.+)$", message, re.IGNORECASE | re.DOTALL)
+            if colon_match:
+                content = colon_match.group(1).strip() or None
+            elif rest.strip() and any(keyword in first_line.lower() for keyword in ["保存", "写入", "save", "write"]):
+                content = rest.strip() or None
+
+        if action == "write":
+            if not content:
+                return WorkspaceTaskPlan(
+                    detected_intent="write_file",
+                    action="needs_clarification",
+                    rationale="用户表达了写入意图，但还没有给出要保存的正文内容。",
+                    reason_code="missing_content",
+                    clarification_question="你想保存什么内容？如果方便，也请一起告诉我目标相对路径。",
+                    next_action_suggestion="ask_user_for_content_and_path",
+                )
+            if not path:
+                if not policy_flags.get("allow_workspace_context_path_inference", True):
+                    return WorkspaceTaskPlan(
+                        detected_intent="write_file",
+                        action="needs_clarification",
+                        rationale="用户要求保存文本，但当前策略不允许在缺路径时自行推断相对路径。",
+                        reason_code="missing_target_path",
+                        extracted_content=content,
+                        clarification_question="要把这段内容保存到哪个相对路径？",
+                        next_action_suggestion="ask_user_for_filename",
+                    )
+                return WorkspaceTaskPlan(
+                    detected_intent="write_file",
+                    action="write_file",
+                    rationale="用户要求保存文本，但没有给出路径；Workspace Agent 需要先结合当前用户工作区结构推断合适相对路径，再执行真实写入。",
+                    reason_code="write_requires_path_inference",
+                    extracted_content=content,
+                    next_action_suggestion="inspect_workspace_then_write",
+                )
+            return WorkspaceTaskPlan(
+                detected_intent="write_file",
+                action="write_file",
+                rationale="用户已经给出了写入意图和可执行的相对路径。",
+                reason_code="write_with_explicit_path",
+                resolved_relative_path=path,
+                extracted_content=content,
+                next_action_suggestion="write_file",
+            )
+
+        if action == "read":
+            if not path:
+                return WorkspaceTaskPlan(
+                    detected_intent="read_file",
+                    action="needs_clarification",
+                    rationale="用户想读取文件，但没有给出明确相对路径。",
+                    reason_code="missing_target_path",
+                    clarification_question="你想读取哪个相对路径的文件？",
+                    next_action_suggestion="ask_user_for_path",
+                )
+            return WorkspaceTaskPlan(
+                detected_intent="read_file",
+                action="read_file",
+                rationale="用户明确要求读取某个文件。",
+                reason_code="read_with_explicit_path",
+                resolved_relative_path=path,
+                next_action_suggestion="read_file",
+            )
+
+        if action == "list" or any(
+            keyword in lowered
+            for keyword in ["目录", "文件", "workspace", "工作区", "有哪些", "列出", "list", "show"]
+        ):
+            return WorkspaceTaskPlan(
+                detected_intent="list_files",
+                action="list_files",
+                rationale="用户要求查看工作区中的文件或目录。",
+                reason_code="list_workspace",
+                directory_prefix=path or "",
+                next_action_suggestion="list_files",
+            )
+
+        return WorkspaceTaskPlan(
+            detected_intent="unknown",
+            action="needs_clarification",
+            rationale="当前请求与工作区相关，但尚不足以判断是读、写还是列目录。",
+            reason_code="ambiguous_workspace_intent",
+            clarification_question="你希望我在当前工作区做什么？例如列文件、读取某个文件，或把文本保存到某个相对路径。",
+            next_action_suggestion="ask_user_for_workspace_intent",
+        )
+
+    def _plan_workspace_delegate(
+        self,
+        agent: Agent | None,
+        *,
+        ctx: RequestContext,
+        delegate_payload: dict[str, Any],
+        healthy_aliases: set[str] | None,
+    ) -> WorkspaceTaskPlan:
+        heuristic_plan = self._heuristic_workspace_task_plan(delegate_payload)
+        model = getattr(agent, "model", None)
+        if model is None:
+            return heuristic_plan
+        delegate_runtime_context = self._build_delegate_runtime_context(
+            agent_name="Workspace Agent",
+            payload=delegate_payload,
+        )
+        planner = Agent(
+            name="Workspace Agent",
+            role="负责工作区任务理解与安全执行决策的专业子智能体",
+            model=model,
+            skills=self.workspace_skills,
+            db=self.agno_db,
+            telemetry=self.settings.telemetry_enabled,
+            markdown=False,
+            instructions=[
+                f"当前用户: {ctx.user_id} ({ctx.display_name})，角色: {ctx.role}。",
+                f"当前租户: {ctx.tenant_id}，当前项目: {ctx.project_id}。",
+                "你要先理解工作区任务，再决定是读、写、列目录、澄清还是阻断。",
+                "如果缺少相对路径，优先结合当前用户工作区结构推断更自然的相对路径，不要退回统一模板目录。",
+                "不要伪造工具结果；这里只负责输出下一步工作区计划。",
+                "所有路径都必须是当前用户 workspace 内的相对路径。",
+                delegate_runtime_context,
+            ],
+            output_schema=WorkspaceTaskPlan,
+            structured_outputs=True,
+            use_json_mode=True,
+        )
+        prompt_text = (
+            "请基于下面的 delegate payload，为 Workspace Agent 输出本轮结构化执行计划。\n"
+            f"delegate_runtime_context:\n{delegate_runtime_context}\n"
+            f"heuristic_candidate(JSON): {json.dumps(heuristic_plan.model_dump(), ensure_ascii=False)}\n"
+            f"delegate_payload(JSON): {self._serialize_delegate_payload_for_prompt(delegate_payload)}"
+        )
+        try:
+            response = planner.run(
+                prompt_text,
+                user_id=ctx.user_id,
+                session_id=f"{ctx.session_id}:workspace_agent_planner",
+            )
+            content = getattr(response, "content", response)
+            plan = content if isinstance(content, WorkspaceTaskPlan) else WorkspaceTaskPlan.model_validate(content)
+            if heuristic_plan.detected_intent != "unknown":
+                if plan.detected_intent == "unknown":
+                    plan.detected_intent = heuristic_plan.detected_intent
+                if plan.action == "needs_clarification" and heuristic_plan.action != "needs_clarification":
+                    plan.action = heuristic_plan.action
+                if not plan.extracted_content and heuristic_plan.extracted_content:
+                    plan.extracted_content = heuristic_plan.extracted_content
+                if not plan.resolved_relative_path and heuristic_plan.resolved_relative_path:
+                    plan.resolved_relative_path = heuristic_plan.resolved_relative_path
+            for field_name in (
+                "reason_code",
+                "directory_prefix",
+                "clarification_question",
+                "next_action_suggestion",
+            ):
+                if not getattr(plan, field_name):
+                    setattr(plan, field_name, getattr(heuristic_plan, field_name))
+            if not plan.used_default_path:
+                plan.used_default_path = heuristic_plan.used_default_path
+            if not str(plan.rationale or "").strip():
+                plan.rationale = heuristic_plan.rationale or "Workspace Agent 已根据当前任务上下文生成执行计划。"
+            if not str(plan.reason_code or "").strip():
+                plan.reason_code = heuristic_plan.reason_code
+            return plan
+        except Exception:
+            return heuristic_plan
+
+    def _build_workspace_agent_response_content(
+        self,
+        *,
+        plan: WorkspaceTaskPlan,
+        status: str,
+        ctx: RequestContext,
+        safe_payload: dict[str, Any] | None = None,
+    ) -> str:
+        if status == "success":
+            if plan.action == "write_file":
+                path = (safe_payload or {}).get("path") or plan.resolved_relative_path or ""
+                return f"已把内容保存到你当前工作区的 `{path}`。"
+            if plan.action == "read_file":
+                path = (safe_payload or {}).get("path") or plan.resolved_relative_path or ""
+                content = str((safe_payload or {}).get("content") or "")
+                return f"已读取你当前工作区的 `{path}`：\n{content}"
+            files = [str(item.get("path") or "") for item in (safe_payload or {}).get("files") or [] if item.get("path")]
+            if not files:
+                return "我查看了你当前工作区，但暂时没有发现可见文件。"
+            return "我查看了你当前工作区，当前可见文件包括：\n" + "\n".join(f"- {path}" for path in files[:20])
+        if status == "needs_clarification":
+            if plan.clarification_question and plan.resolved_relative_path:
+                return (
+                    f"{plan.clarification_question}\n"
+                    f"如果你愿意，我也可以直接保存到 `{plan.resolved_relative_path}`。"
+                )
+            if plan.clarification_question:
+                return plan.clarification_question
+            return "我可以继续处理这个工作区任务，但还需要你补充一点关键信息。"
+        if status == "policy_blocked":
+            return (
+                "这次工作区操作被安全策略阻断了。"
+                f"\n原因：{plan.rationale}"
+            )
+        return (
+            "我在处理工作区任务时遇到了错误。"
+            f"\n原因：{plan.rationale}"
+        )
+
     def _run_workspace_delegate(
         self,
+        agent: Agent | None,
         ctx: RequestContext,
         prompt: str,
         *,
+        delegate_payload: dict[str, Any] | None = None,
         healthy_aliases: set[str] | None,
     ) -> RunOutput:
-        decision = self._classify_workspace_access(prompt, healthy_aliases=healthy_aliases)
-        action = str(decision.get("action") or "list")
-        if action == "write":
-            path = str(decision.get("path") or "").strip()
-            content = str(decision.get("content") or "").strip()
-            if not path or not content:
-                raise ValueError("当前无法安全解析写入路径或内容，请明确给出相对路径和内容。")
-            tool_name = "workspace_save_text_file"
-            tool_args = {"path": path, "content": content, "overwrite": True}
-            payload = call_workspace_mcp_tool(self.settings, ctx, tool_name, tool_args)
-        elif action == "read":
-            path = str(decision.get("path") or "").strip()
-            if not path:
-                raise ValueError("当前无法安全解析要读取的相对路径，请明确指定文件名。")
-            tool_name = "workspace_read_text_file"
-            tool_args = {"path": path, "max_chars": 6000}
-            payload = call_workspace_mcp_tool(self.settings, ctx, tool_name, tool_args)
-        else:
-            action = "list"
-            tool_name = "workspace_list_files"
-            tool_args = {"prefix": "", "limit": 50}
-            payload = call_workspace_mcp_tool(self.settings, ctx, tool_name, tool_args)
-        safe_payload = self._sanitize_workspace_guard_payload(action, payload, ctx)
+        payload = delegate_payload or self._build_delegate_payload(
+            agent_name="Workspace Agent",
+            ctx=ctx,
+            original_user_message=prompt,
+            delegate_instruction="请完成当前工作区相关任务。",
+            evidence_blocks=[],
+            iteration=1,
+            allowed_tools=["workspace_list_files", "workspace_read_text_file", "workspace_save_text_file"],
+            agent_role="通过 Workspace MCP 访问当前用户工作区",
+            prior_attempts=[],
+        )
+        plan = self._plan_workspace_delegate(
+            agent,
+            ctx=ctx,
+            delegate_payload=payload,
+            healthy_aliases=healthy_aliases,
+        )
+        tool_calls: list[dict[str, Any]] = []
+        tool_executions: list[ToolExecution] = []
+        metadata: dict[str, Any] = {
+            "delegate_mode": "autonomous_workspace_agent",
+            "delegate_payload": self._sanitize_delegate_payload_for_trace(payload),
+            "delegate_payload_signature": payload.get("payload_signature"),
+            "detected_intent": plan.detected_intent,
+            "reason_code": plan.reason_code,
+            "resolved_relative_path": plan.resolved_relative_path,
+            "extracted_content": plan.extracted_content,
+            "next_action_suggestion": plan.next_action_suggestion,
+            "used_default_path": plan.used_default_path,
+            "rationale": plan.rationale,
+        }
+        if plan.action == "needs_clarification":
+            metadata["status"] = "needs_clarification"
+            return RunOutput(
+                agent_name="Workspace Agent",
+                content=self._build_workspace_agent_response_content(
+                    plan=plan,
+                    status="needs_clarification",
+                    ctx=ctx,
+                ),
+                tools=[],
+                metadata=metadata,
+            )
+        if plan.action == "policy_blocked":
+            metadata["status"] = "policy_blocked"
+            return RunOutput(
+                agent_name="Workspace Agent",
+                content=self._build_workspace_agent_response_content(
+                    plan=plan,
+                    status="policy_blocked",
+                    ctx=ctx,
+                ),
+                tools=[],
+                metadata=metadata,
+            )
+
+        if plan.action == "write_file" and not plan.resolved_relative_path:
+            snapshot_args = {"prefix": "", "limit": 200}
+            workspace_files: list[dict[str, Any]] = []
+            try:
+                snapshot_payload = call_workspace_mcp_tool(
+                    self.settings,
+                    ctx,
+                    "workspace_list_files",
+                    snapshot_args,
+                )
+                snapshot_safe_payload = self._sanitize_workspace_guard_payload("list", snapshot_payload, ctx)
+                workspace_files = list(snapshot_safe_payload.get("files") or [])
+                tool_calls.append(
+                    {
+                        "tool": "workspace_list_files",
+                        "args": snapshot_args,
+                        "result": snapshot_safe_payload,
+                    }
+                )
+                tool_executions.append(
+                    self._make_tool_execution(
+                        tool_name="workspace_list_files",
+                        tool_args=snapshot_args,
+                        result=snapshot_safe_payload,
+                    )
+                )
+            except Exception as exc:
+                tool_calls.append(
+                    {
+                        "tool": "workspace_list_files",
+                        "args": snapshot_args,
+                        "error": str(exc),
+                    }
+                )
+            inferred_path, reason_code = self._infer_workspace_write_path(
+                message=str(payload.get("original_user_message") or prompt),
+                content=str(plan.extracted_content or ""),
+                workspace_files=workspace_files,
+            )
+            plan.resolved_relative_path = inferred_path
+            plan.reason_code = reason_code
+            plan.detected_intent = "write_file"
+            plan.next_action_suggestion = "write_file"
+            plan.used_default_path = False
+            metadata["resolved_relative_path"] = inferred_path
+            metadata["reason_code"] = reason_code
+            metadata["detected_intent"] = "write_file"
+            metadata["next_action_suggestion"] = "write_file"
+
+        try:
+            if plan.action == "write_file":
+                tool_name = "workspace_save_text_file"
+                tool_args = {
+                    "path": str(plan.resolved_relative_path or "").strip().lstrip("/"),
+                    "content": str(plan.extracted_content or ""),
+                    "overwrite": bool(plan.overwrite),
+                }
+                payload_result = call_workspace_mcp_tool(self.settings, ctx, tool_name, tool_args)
+                safe_payload = self._sanitize_workspace_guard_payload("write", payload_result, ctx)
+            elif plan.action == "read_file":
+                tool_name = "workspace_read_text_file"
+                tool_args = {
+                    "path": str(plan.resolved_relative_path or "").strip().lstrip("/"),
+                    "max_chars": 6000,
+                }
+                payload_result = call_workspace_mcp_tool(self.settings, ctx, tool_name, tool_args)
+                safe_payload = self._sanitize_workspace_guard_payload("read", payload_result, ctx)
+            else:
+                tool_name = "workspace_list_files"
+                tool_args = {"prefix": str(plan.directory_prefix or ""), "limit": 50}
+                payload_result = call_workspace_mcp_tool(self.settings, ctx, tool_name, tool_args)
+                safe_payload = self._sanitize_workspace_guard_payload("list", payload_result, ctx)
+        except Exception as exc:
+            metadata["status"] = "tool_error"
+            metadata["tool_evidence"] = []
+            return RunOutput(
+                agent_name="Workspace Agent",
+                content=(
+                    "Workspace Agent 在调用 Workspace MCP 时失败。\n"
+                    f"- reason_code: workspace_tool_error\n"
+                    f"- error: {exc}"
+                ),
+                tools=[],
+                metadata={
+                    **metadata,
+                    "reason_code": "workspace_tool_error",
+                    "error": str(exc),
+                    "tool_calls": tool_calls,
+                },
+            )
+
+        metadata["status"] = "success"
+        metadata["next_action_suggestion"] = "finalize_with_tool_result"
+        tool_calls.append({"tool": tool_name, "args": tool_args, "result": safe_payload})
+        tool_executions.append(
+            self._make_tool_execution(tool_name=tool_name, tool_args=tool_args, result=safe_payload)
+        )
+        metadata["tool_evidence"] = [
+            {
+                "tool": item["tool"],
+                "path": item.get("result", {}).get("path") or item.get("result", {}).get("root"),
+            }
+            for item in tool_calls
+            if isinstance(item.get("result"), dict)
+        ]
+        metadata["tool_calls"] = tool_calls
         return RunOutput(
             agent_name="Workspace Agent",
-            content=self._build_workspace_delegate_content(action, safe_payload, ctx),
-            tools=[self._make_tool_execution(tool_name=tool_name, tool_args=tool_args, result=safe_payload)],
-            metadata={
-                "delegate_mode": "explicit_runtime_executor",
-                "action": action,
-                "safe_payload": safe_payload,
-            },
+            content=self._build_workspace_agent_response_content(
+                plan=plan,
+                status="success",
+                ctx=ctx,
+                safe_payload=safe_payload,
+            ),
+            tools=tool_executions,
+            metadata={**metadata, "safe_payload": safe_payload, "action": plan.action},
         )
 
     def _run_knowledge_delegate(self, ctx: RequestContext, prompt: str) -> RunOutput:
@@ -442,7 +1450,16 @@ class OrchestratorRuntime:
             ],
             metadata={
                 "delegate_mode": "explicit_runtime_executor",
+                "status": "success",
+                "reason_code": "knowledge_hits_found" if hits else "knowledge_no_match",
                 "knowledge_hits": hits,
+                "tool_calls": [
+                    {
+                        "tool": "search_project_knowledge",
+                        "args": {"query": prompt, "limit": 4},
+                        "result_count": len(hits),
+                    }
+                ],
             },
         )
 
@@ -509,7 +1526,27 @@ class OrchestratorRuntime:
                     },
                 )
             ],
-            metadata={"delegate_mode": "explicit_runtime_executor"},
+            metadata={
+                "delegate_mode": "explicit_runtime_executor",
+                "status": "success",
+                "reason_code": "execution_completed",
+                "tool_calls": [
+                    {
+                        "tool": "execute_in_sandbox",
+                        "args": {
+                            "command": request.command,
+                            "entrypoint": request.entrypoint,
+                            "timeout_seconds": request.timeout_seconds,
+                            "writeback": request.writeback,
+                        },
+                        "result": {
+                            "job_id": result.job.job_id,
+                            "status": result.job.status,
+                            "artifacts": [item.relative_path for item in result.artifacts],
+                        },
+                    }
+                ],
+            },
         )
 
     def _run_external_delegate(self, ctx: RequestContext, prompt: str) -> RunOutput:
@@ -529,25 +1566,48 @@ class OrchestratorRuntime:
                     result=result.model_dump(),
                 )
             ],
-            metadata={"delegate_mode": "explicit_runtime_executor"},
+            metadata={
+                "delegate_mode": "explicit_runtime_executor",
+                "status": "success",
+                "reason_code": "external_delegate_completed",
+                "tool_calls": [
+                    {
+                        "tool": "delegate_to_external_agent",
+                        "args": {"message": prompt, "agent_id": result.selected_agent.agent_id},
+                        "result": {
+                            "selected_agent": result.selected_agent.agent_id,
+                            "status": getattr(result, "status", None),
+                        },
+                    }
+                ],
+            },
         )
 
     def _run_explicit_delegate(
         self,
+        agent: Agent,
         agent_name: str,
         *,
         prompt: str,
         ctx: RequestContext,
+        delegate_payload: dict[str, Any] | None = None,
         healthy_aliases: set[str] | None,
     ) -> RunOutput | None:
+        source_prompt = str((delegate_payload or {}).get("original_user_message") or prompt)
         if agent_name == "Workspace Agent":
-            return self._run_workspace_delegate(ctx, prompt, healthy_aliases=healthy_aliases)
+            return self._run_workspace_delegate(
+                agent,
+                ctx,
+                source_prompt,
+                delegate_payload=delegate_payload,
+                healthy_aliases=healthy_aliases,
+            )
         if agent_name == "Knowledge Agent":
-            return self._run_knowledge_delegate(ctx, prompt)
+            return self._run_knowledge_delegate(ctx, source_prompt)
         if agent_name == "Execution Agent":
-            return self._run_execution_delegate(ctx, prompt, healthy_aliases=healthy_aliases)
+            return self._run_execution_delegate(ctx, source_prompt, healthy_aliases=healthy_aliases)
         if agent_name == "External Agent Broker":
-            return self._run_external_delegate(ctx, prompt)
+            return self._run_external_delegate(ctx, source_prompt)
         return None
 
     def _agent_has_required_evidence(self, agent_name: str, run_output: RunOutput | None) -> bool:
@@ -634,12 +1694,15 @@ class OrchestratorRuntime:
         prompt: str,
         ctx: RequestContext,
         evidence_blocks: list[dict[str, Any]],
+        delegate_payload: dict[str, Any] | None = None,
         healthy_aliases: set[str] | None = None,
     ) -> RunOutput:
         explicit = self._run_explicit_delegate(
+            agent,
             agent_name,
             prompt=prompt,
             ctx=ctx,
+            delegate_payload=delegate_payload,
             healthy_aliases=healthy_aliases,
         )
         if explicit is not None:
@@ -649,6 +1712,7 @@ class OrchestratorRuntime:
             prompt=prompt,
             ctx=ctx,
             evidence_blocks=evidence_blocks,
+            delegate_payload=delegate_payload,
         )
         return agent.run(
             task_prompt,
@@ -669,6 +1733,7 @@ class OrchestratorRuntime:
             r"(文件|目录|工作区|workspace|空间|folder|directory).{0,6}(有哪些|有什么|列表|列出|内容|list|show)",
             r"(读取|读|打开|查看|read|open).{0,8}(文件|目录|workspace|file|directory)",
             r"(写入|保存|写|save|write).{0,8}(文件|目录|工作区|workspace|file|directory)",
+            r"(写入|保存|存一下|save|write).{0,12}(下面的内容|以下内容|内容|正文|文本|text)",
         ]
         direct_path_action = bool(
             path_match
@@ -695,6 +1760,10 @@ class OrchestratorRuntime:
         content_match = re.search(r"(?:内容|content)\s*[:：]\s*(.+)$", prompt, re.IGNORECASE | re.DOTALL)
         if content_match:
             content = content_match.group(1).strip()
+        elif action == "write":
+            first_line, _, rest = prompt.partition("\n")
+            if rest.strip() and any(keyword in first_line.lower() for keyword in ["保存", "写入", "save", "write", "存一下"]):
+                content = rest.strip()
         return {"action": action, "path": path, "content": content}
 
     def _extract_code_block(self, prompt: str) -> tuple[str | None, str | None]:
@@ -971,12 +2040,18 @@ class OrchestratorRuntime:
 
     def _record_member_outputs(self, ctx: RequestContext, member_outputs: list[dict]) -> None:
         for index, item in enumerate(member_outputs, start=1):
+            extra_payload = {
+                key: value
+                for key, value in item.items()
+                if key not in {"name", "content", "phase"} and value is not None
+            }
             self.database.record_member_output(
                 ctx,
                 member_name=item["name"],
                 order=index,
                 content=item["content"],
                 phase=item.get("phase", "team"),
+                metadata=extra_payload or None,
             )
 
     def _model_routes_snapshot(self) -> dict[str, str]:
@@ -1508,7 +2583,7 @@ class OrchestratorRuntime:
             members.append(
                 Agent(
                     name="Workspace Agent",
-                    role="查看当前用户自己的文件空间，提取与任务相关的本地上下文",
+                    role="管理当前用户自己的工作区文件，读取、保存并整理与当前任务相关的本地内容",
                     model=build_agno_model(self.settings, workspace_route.alias),
                     skills=self.workspace_skills,
                     tools=[workspace_tools],
@@ -1516,8 +2591,8 @@ class OrchestratorRuntime:
                     markdown=True,
                     instructions=[
                         f"你只能访问当前用户 {ctx.user_id} 的工作区。",
-                        "需要先列出文件，再读取最相关的文件。",
-                        "如用户明确要求写入，可通过 MCP 保存文本文件，并说明写入结果。",
+                        "先理解当前任务是列目录、读取文件还是保存文本，再决定使用哪个 MCP 工具。",
+                        "如用户要求保存内容但没给相对路径，先感知当前用户工作区结构，再推断最合适的相对路径并执行真实写入。",
                         "不要假设存在某个文件，先确认再读取。",
                         f"当前为统一模型网关路由，task_type=workspace，alias={workspace_route.alias}。",
                     ],
@@ -1525,7 +2600,7 @@ class OrchestratorRuntime:
                     telemetry=self.settings.telemetry_enabled,
                 )
             )
-            enabled_descriptions.append("当请求需要用户文件、草稿、笔记时，先委托 Workspace Agent。")
+            enabled_descriptions.append("当请求需要用户文件、草稿、笔记或工作区写入时，先委托 Workspace Agent。")
 
         test_cfg = agent_map.get("test_agent")
         if test_cfg and test_cfg.included_in_team:
@@ -1716,80 +2791,66 @@ class OrchestratorRuntime:
         team, captured_hits, model_routes, effective_agent_payload = self.build_team(
             ctx, healthy_aliases=healthy_aliases
         )
-        member_agents = {member.name: member for member in team.members if isinstance(member, Agent)}
-
-        member_outputs: list[dict] = list(prefetched_member_outputs)
-        member_outputs.append(
-            {
-                "name": "Enterprise Orchestrator",
-                "phase": "plan",
-                "content": self._summarize_plan(routing_plan),
-            }
-        )
+        member_agents = {
+            member.name: member
+            for member in team.members
+            if getattr(member, "name", None) and callable(getattr(member, "run", None))
+        }
+        working_prompt = enriched_prompt or prompt
+        member_outputs: list[dict[str, Any]] = []
         selected_agents: list[str] = ["Enterprise Orchestrator", *prefetched_agents]
         notes = list(routing_plan.notes)
         delegated_results: dict[str, RunOutput] = {}
-        delegated_evidence_blocks: list[dict[str, Any]] = [
-            {
-                "name": item["name"],
-                "phase": item.get("phase", ""),
-                "content": item["content"],
-            }
-            for item in prefetched_member_outputs
-        ]
+        evidence_blocks: list[dict[str, Any]] = []
         required_agents = self._ordered_required_agents(routing_plan.required_agents)
-        for agent_name in required_agents:
-            agent = member_agents.get(agent_name)
-            if agent is None:
-                continue
-            try:
-                run_output = self._run_delegate_agent(
-                    agent,
-                    agent_name=agent_name,
-                    prompt=prompt,
-                    ctx=ctx,
-                    evidence_blocks=delegated_evidence_blocks,
-                    healthy_aliases=healthy_aliases,
-                )
-            except Exception as exc:
-                run_output = RunOutput(
-                    agent_name=agent_name,
-                    content=f"{agent_name} 执行失败: {exc}",
-                )
-            delegated_results[agent_name] = run_output
-            tool_names = self._tool_names_from_run_output(run_output)
-            tool_summary = ", ".join(tool_names) if tool_names else "none"
-            content = str(getattr(run_output, "content", "") or "").strip() or "未返回内容。"
-            member_outputs.append(
-                {
-                    "name": agent_name,
-                    "phase": "delegate",
-                    "content": f"tool_evidence={tool_summary}\n{content}",
-                }
-            )
-            delegated_evidence_blocks.append(
-                {
-                    "name": agent_name,
-                    "phase": "delegate",
-                    "content": content,
-                }
-            )
-            selected_agents.append(agent_name)
-            if agent_name == "Knowledge Agent":
-                knowledge_hits = list((getattr(run_output, "metadata", {}) or {}).get("knowledge_hits") or [])
-                if knowledge_hits:
-                    captured_hits[:] = knowledge_hits
+        available_agents = self._available_orchestration_agents(member_agents, effective_agent_payload)
+        available_agent_map = {item["name"]: item for item in available_agents}
+        max_iterations = self._max_orchestration_iterations(member_agents)
+        iteration_count = 0
+        stop_reason: str | None = None
+        retry_missing_agents: list[str] | None = None
+        final_answer = ""
+        observation_history: list[dict[str, Any]] = []
 
-        missing_required_agents = [
-            agent_name
-            for agent_name in required_agents
-            if not self._agent_has_required_evidence(agent_name, delegated_results.get(agent_name))
+        for item in prefetched_member_outputs:
+            step = self._make_orchestration_step(
+                name=item["name"],
+                phase=item.get("phase", "prefetch"),
+                content=item["content"],
+                target_agent=item["name"] if item["name"] != "Enterprise Orchestrator" else None,
+            )
+            member_outputs.append(step)
+            evidence_blocks.append(
+                {
+                    "name": item["name"],
+                    "phase": item.get("phase", "prefetch"),
+                    "content": item["content"],
+                }
+            )
+
+        member_outputs.append(
+            self._make_orchestration_step(
+                name="Enterprise Orchestrator",
+                phase="plan",
+                content=self._summarize_plan(routing_plan),
+            )
+        )
+
+        unavailable_required_agents = [
+            agent_name for agent_name in required_agents if agent_name not in member_agents
         ]
-        if missing_required_agents:
-            notes.append(f"agent_gate_missing_evidence={','.join(missing_required_agents)}")
+        if unavailable_required_agents:
+            notes.append(f"required_agent_unavailable={','.join(unavailable_required_agents)}")
             failure_text, blocked_outputs = self._build_gate_failure(
-                missing_required_agents[0],
+                unavailable_required_agents[0],
                 delegated_outputs=member_outputs,
+            )
+            blocked_outputs[-1].update(
+                {
+                    "status": "blocked",
+                    "step_type": "gate_block",
+                    "stop_reason": "required_agent_unavailable",
+                }
             )
             selected_agents = list(dict.fromkeys(selected_agents))
             self._record_member_outputs(ctx, blocked_outputs)
@@ -1803,44 +2864,364 @@ class OrchestratorRuntime:
                 model_routes=model_routes,
                 prefetch_info=prefetch_info,
                 effective_agents=effective_agent_payload,
+                iteration_count=0,
+                stop_reason="required_agent_unavailable",
+                orchestration_steps=[dict(item) for item in blocked_outputs],
             )
 
-        synthesizer = Agent(
-            name="Enterprise Orchestrator",
-            role="整合已验证的成员证据并生成最终用户答复",
-            model=team.model,
-            skills=self.orchestrator_skills,
-            markdown=True,
-            instructions=[
-                f"当前用户: {ctx.user_id} ({ctx.display_name})，角色: {ctx.role}。",
-                f"当前租户: {ctx.tenant_id}，当前项目: {ctx.project_id}。",
-                "你现在处于最终整合阶段。",
-                "你只能基于已经拿到的成员证据回答，不能再说“我会去查看”或“我先去处理”。",
-                "如果成员证据为空，就如实说明；不要补出不存在的文件、目录、知识或执行结果。",
-                "严禁跨项目、跨用户引用信息。",
-            ],
-            additional_context=(
-                self.orchestrator_skills.get_system_prompt_snippet()
-                if self.orchestrator_skills
-                else None
-            ),
-            db=self.agno_db,
-            telemetry=self.settings.telemetry_enabled,
-        )
-        synthesize_prompt = self._build_synthesizer_prompt(
-            prompt=prompt,
-            ctx=ctx,
-            delegated_outputs=member_outputs,
-        )
-        response = synthesizer.run(
-            synthesize_prompt,
-            user_id=ctx.user_id,
-            session_id=f"{ctx.session_id}:orchestrator_synthesize",
-        )
-        final_answer = str(getattr(response, "content", "") or "").strip()
+        for iteration in range(1, max_iterations + 1):
+            iteration_count = iteration
+            pending_required_agents = [
+                agent_name
+                for agent_name in required_agents
+                if not self._agent_has_required_evidence(agent_name, delegated_results.get(agent_name))
+            ]
+            decision = self._decide_orchestration_step(
+                ctx=ctx,
+                prompt=prompt,
+                effective_prompt=working_prompt,
+                routing_plan=routing_plan,
+                available_agents=available_agents,
+                evidence_blocks=evidence_blocks,
+                iteration=iteration,
+                max_iterations=max_iterations,
+                model=team.model,
+                notes=notes,
+                pending_required_agents=pending_required_agents,
+                retry_missing_agents=retry_missing_agents,
+            )
+            target_agent = str(decision.target_agent or "").strip() or None
+            delegate_instruction = str(decision.delegate_instruction or "").strip() or None
+            decision_content_lines = [
+                f"action={decision.action}",
+                f"pending_required_agents={','.join(pending_required_agents) or 'none'}",
+                f"rationale={decision.rationale}",
+            ]
+            if target_agent:
+                decision_content_lines.append(f"target_agent={target_agent}")
+            if delegate_instruction:
+                decision_content_lines.append(f"delegate_instruction={delegate_instruction}")
+            if decision.action == "finalize":
+                decision_content_lines.append(
+                    f"stop_reason={str(decision.stop_reason or '').strip() or 'none'}"
+                )
+            member_outputs.append(
+                self._make_orchestration_step(
+                    name="Enterprise Orchestrator",
+                    phase="decision",
+                    content="\n".join(decision_content_lines),
+                    iteration=iteration,
+                    target_agent=target_agent,
+                    stop_reason=(
+                        str(decision.stop_reason or "").strip() or None
+                        if decision.action == "finalize"
+                        else None
+                    ),
+                )
+            )
+
+            if decision.action == "finalize":
+                if pending_required_agents:
+                    retry_missing_agents = list(pending_required_agents)
+                    notes.append(
+                        "orchestrator_finalize_blocked_missing_required="
+                        + ",".join(pending_required_agents)
+                    )
+                    continue
+                final_answer = str(decision.final_answer or "").strip()
+                if not final_answer:
+                    final_answer = "当前没有拿到足够的成员结果，暂时无法形成最终答复。"
+                    notes.append("orchestrator_empty_finalize_fallback")
+                stop_reason = str(decision.stop_reason or "").strip() or (
+                    "direct_response" if not evidence_blocks else "sufficient_evidence"
+                )
+                member_outputs.append(
+                    self._make_orchestration_step(
+                        name="Enterprise Orchestrator",
+                        phase="finalize",
+                        content=final_answer,
+                        iteration=iteration,
+                        stop_reason=stop_reason,
+                    )
+                )
+                break
+
+            if target_agent is None:
+                retry_missing_agents = list(pending_required_agents)
+                notes.append("orchestrator_delegate_missing_target")
+                continue
+
+            agent = member_agents.get(target_agent)
+            if agent is None:
+                retry_missing_agents = list(pending_required_agents)
+                notes.append(f"orchestrator_delegate_unknown_agent={target_agent}")
+                continue
+
+            delegate_instruction = self._default_delegate_instruction(
+                target_agent,
+                delegate_instruction or str(decision.rationale or "").strip(),
+            )
+            agent_descriptor = available_agent_map.get(target_agent, {})
+            delegate_payload = self._build_delegate_payload(
+                agent_name=target_agent,
+                ctx=ctx,
+                original_user_message=prompt,
+                delegate_instruction=delegate_instruction,
+                evidence_blocks=evidence_blocks,
+                iteration=iteration,
+                allowed_tools=self._delegate_allowed_tools(target_agent, agent_descriptor),
+                agent_role=str(agent_descriptor.get("role") or ""),
+                prior_attempts=self._recent_attempts_for_agent(observation_history, target_agent),
+            )
+            member_outputs.append(
+                self._make_orchestration_step(
+                    name="Enterprise Orchestrator",
+                    phase="delegate",
+                    content=(
+                        f"target_agent={target_agent}\n"
+                        f"instruction={delegate_instruction}\n"
+                        f"delegate_payload={json.dumps(self._sanitize_delegate_payload_for_trace(delegate_payload), ensure_ascii=False)}"
+                    ),
+                    iteration=iteration,
+                    target_agent=target_agent,
+                    status="started",
+                    delegate_payload=self._sanitize_delegate_payload_for_trace(delegate_payload),
+                    payload_signature=delegate_payload.get("payload_signature"),
+                )
+            )
+            delegate_prompt = (
+                f"{prompt}\n\n[Enterprise Orchestrator 本轮委托]\n{delegate_instruction}"
+            ).strip()
+            try:
+                run_output = self._run_delegate_agent(
+                    agent,
+                    agent_name=target_agent,
+                    prompt=delegate_prompt,
+                    ctx=ctx,
+                    evidence_blocks=evidence_blocks,
+                    delegate_payload=delegate_payload,
+                    healthy_aliases=healthy_aliases,
+                )
+            except Exception as exc:
+                run_output = RunOutput(
+                    agent_name=target_agent,
+                    content=f"{target_agent} 执行失败: {exc}",
+                )
+            delegated_results[target_agent] = run_output
+            tool_names = self._tool_names_from_run_output(run_output)
+            tool_summary = ", ".join(tool_names) if tool_names else "none"
+            content = str(getattr(run_output, "content", "") or "").strip() or "未返回内容。"
+            run_metadata = dict(getattr(run_output, "metadata", {}) or {})
+            observe_status = str(
+                run_metadata.get("status")
+                or (
+                    "success"
+                    if self._agent_has_required_evidence(target_agent, run_output) or bool(content.strip())
+                    else "empty"
+                )
+            ).strip()
+            reason_code = str(run_metadata.get("reason_code") or "").strip() or None
+            payload_signature = str(
+                run_metadata.get("delegate_payload_signature") or delegate_payload.get("payload_signature") or ""
+            ).strip() or None
+            observation_history.append(
+                {
+                    "agent_name": target_agent,
+                    "status": observe_status,
+                    "reason_code": reason_code,
+                    "payload_signature": payload_signature,
+                    "content": content,
+                    "next_action_suggestion": run_metadata.get("next_action_suggestion"),
+                }
+            )
+            observe_status = (
+                "completed"
+                if observe_status in {"success", "needs_clarification", "policy_blocked"}
+                else observe_status
+            )
+            member_outputs.append(
+                self._make_orchestration_step(
+                    name=target_agent,
+                    phase="observe",
+                    content=f"tool_evidence={tool_summary}\n{content}",
+                    iteration=iteration,
+                    target_agent=target_agent,
+                    status=observe_status,
+                    tool_evidence=tool_names,
+                    reason_code=reason_code,
+                    detected_intent=run_metadata.get("detected_intent"),
+                    resolved_relative_path=run_metadata.get("resolved_relative_path"),
+                    next_action_suggestion=run_metadata.get("next_action_suggestion"),
+                    delegate_payload=run_metadata.get("delegate_payload"),
+                    payload_signature=payload_signature,
+                    tool_calls=run_metadata.get("tool_calls"),
+                    used_default_path=run_metadata.get("used_default_path"),
+                )
+            )
+            evidence_blocks.append(
+                {
+                    "name": target_agent,
+                    "phase": "observe",
+                    "content": content,
+                    "status": run_metadata.get("status"),
+                    "reason_code": reason_code,
+                    "detected_intent": run_metadata.get("detected_intent"),
+                    "resolved_relative_path": run_metadata.get("resolved_relative_path"),
+                    "next_action_suggestion": run_metadata.get("next_action_suggestion"),
+                    "tool_calls": run_metadata.get("tool_calls"),
+                }
+            )
+            selected_agents.append(target_agent)
+            if target_agent == "Knowledge Agent":
+                knowledge_hits = list((getattr(run_output, "metadata", {}) or {}).get("knowledge_hits") or [])
+                if knowledge_hits:
+                    captured_hits[:] = self._dedupe_knowledge_hits([*captured_hits, *knowledge_hits])
+            repeated_failure_streak = self._repeat_failure_streak(
+                observation_history,
+                agent_name=target_agent,
+                reason_code=reason_code,
+                payload_signature=payload_signature,
+            )
+            if run_metadata.get("status") == "needs_clarification":
+                final_answer = content
+                stop_reason = "needs_clarification"
+                member_outputs.append(
+                    self._make_orchestration_step(
+                        name="Enterprise Orchestrator",
+                        phase="finalize",
+                        content=final_answer,
+                        iteration=iteration,
+                        stop_reason=stop_reason,
+                        status="completed",
+                    )
+                )
+                break
+            if run_metadata.get("status") == "policy_blocked":
+                failure_text = content
+                stop_reason = "policy_blocked"
+                member_outputs.append(
+                    self._make_orchestration_step(
+                        name="Enterprise Orchestrator",
+                        phase="gate_block",
+                        content=failure_text,
+                        iteration=iteration,
+                        stop_reason=stop_reason,
+                        status="blocked",
+                    )
+                )
+                selected_agents = list(dict.fromkeys(selected_agents))
+                self._record_member_outputs(ctx, member_outputs)
+                return RunResult(
+                    answer=failure_text,
+                    mode="agent_gate_blocked",
+                    selected_agents=selected_agents,
+                    member_outputs=member_outputs,
+                    knowledge_hits=captured_hits,
+                    notes=notes,
+                    model_routes=model_routes,
+                    prefetch_info=prefetch_info,
+                    effective_agents=effective_agent_payload,
+                    iteration_count=iteration,
+                    stop_reason=stop_reason,
+                    orchestration_steps=[dict(item) for item in member_outputs],
+                )
+            if repeated_failure_streak >= 2 and reason_code:
+                final_answer = content
+                stop_reason = (
+                    "needs_clarification"
+                    if reason_code.startswith("missing_") or run_metadata.get("status") == "needs_clarification"
+                    else "repeated_agent_failure"
+                )
+                notes.append(f"agent_failure_circuit_open={target_agent}:{reason_code}")
+                member_outputs.append(
+                    self._make_orchestration_step(
+                        name="Enterprise Orchestrator",
+                        phase="finalize" if stop_reason == "needs_clarification" else "gate_block",
+                        content=final_answer,
+                        iteration=iteration,
+                        stop_reason=stop_reason,
+                        status="completed" if stop_reason == "needs_clarification" else "blocked",
+                    )
+                )
+                if stop_reason != "needs_clarification":
+                    selected_agents = list(dict.fromkeys(selected_agents))
+                    self._record_member_outputs(ctx, member_outputs)
+                    return RunResult(
+                        answer=final_answer,
+                        mode="agent_gate_blocked",
+                        selected_agents=selected_agents,
+                        member_outputs=member_outputs,
+                        knowledge_hits=captured_hits,
+                        notes=notes,
+                        model_routes=model_routes,
+                        prefetch_info=prefetch_info,
+                        effective_agents=effective_agent_payload,
+                        iteration_count=iteration,
+                        stop_reason=stop_reason,
+                        orchestration_steps=[dict(item) for item in member_outputs],
+                    )
+                break
+            if target_agent in pending_required_agents and not self._agent_has_required_evidence(
+                target_agent,
+                run_output,
+            ):
+                retry_missing_agents = [target_agent]
+                notes.append(f"required_agent_missing_evidence_after_observe={target_agent}")
+            else:
+                retry_missing_agents = None
+
         if not final_answer:
-            final_answer = "当前没有拿到足够的成员结果，暂时无法形成最终答复。"
-            notes.append("synthesizer_empty_fallback")
+            pending_required_agents = [
+                agent_name
+                for agent_name in required_agents
+                if not self._agent_has_required_evidence(agent_name, delegated_results.get(agent_name))
+            ]
+            if pending_required_agents:
+                notes.append(f"agent_gate_missing_evidence={','.join(pending_required_agents)}")
+                failure_text, blocked_outputs = self._build_gate_failure(
+                    pending_required_agents[0],
+                    delegated_outputs=member_outputs,
+                )
+                blocked_outputs[-1].update(
+                    {
+                        "iteration": iteration_count,
+                        "status": "blocked",
+                        "step_type": "gate_block",
+                        "stop_reason": "required_agent_evidence_missing",
+                    }
+                )
+                selected_agents = list(dict.fromkeys(selected_agents))
+                self._record_member_outputs(ctx, blocked_outputs)
+                return RunResult(
+                    answer=failure_text,
+                    mode="agent_gate_blocked",
+                    selected_agents=selected_agents,
+                    member_outputs=blocked_outputs,
+                    knowledge_hits=captured_hits,
+                    notes=notes,
+                    model_routes=model_routes,
+                    prefetch_info=prefetch_info,
+                    effective_agents=effective_agent_payload,
+                    iteration_count=iteration_count,
+                    stop_reason="required_agent_evidence_missing",
+                    orchestration_steps=[dict(item) for item in blocked_outputs],
+                )
+            stop_reason = stop_reason or "max_iterations_reached"
+            final_answer = (
+                f"Enterprise Orchestrator 在 {iteration_count} 轮内仍未收敛到最终答复，"
+                "系统已停止，以避免在边界不清时继续推断。"
+            )
+            member_outputs.append(
+                self._make_orchestration_step(
+                    name="Enterprise Orchestrator",
+                    phase="finalize",
+                    content=final_answer,
+                    iteration=iteration_count,
+                    status="failed",
+                    stop_reason=stop_reason,
+                )
+            )
+
         if (
             "Workspace Agent" not in required_agents
             and not self._agent_has_required_evidence("Workspace Agent", delegated_results.get("Workspace Agent"))
@@ -1851,11 +3232,14 @@ class OrchestratorRuntime:
                 "系统已拦截该结果，以避免权限越界。"
             )
             member_outputs.append(
-                {
-                    "name": "Enterprise Orchestrator",
-                    "phase": "gate_block",
-                    "content": failure_text,
-                }
+                self._make_orchestration_step(
+                    name="Enterprise Orchestrator",
+                    phase="gate_block",
+                    content=failure_text,
+                    iteration=iteration_count,
+                    status="blocked",
+                    stop_reason="repo_listing_without_workspace_evidence",
+                )
             )
             selected_agents = list(dict.fromkeys(selected_agents))
             notes.append("agent_gate_blocked_repo_listing_without_workspace_evidence")
@@ -1870,14 +3254,11 @@ class OrchestratorRuntime:
                 model_routes=model_routes,
                 prefetch_info=prefetch_info,
                 effective_agents=effective_agent_payload,
+                iteration_count=iteration_count,
+                stop_reason="repo_listing_without_workspace_evidence",
+                orchestration_steps=[dict(item) for item in member_outputs],
             )
-        member_outputs.append(
-            {
-                "name": "Enterprise Orchestrator",
-                "phase": "synthesize",
-                "content": final_answer,
-            }
-        )
+
         selected_agents = list(dict.fromkeys(selected_agents))
         self._record_member_outputs(ctx, member_outputs)
         return RunResult(
@@ -1890,6 +3271,9 @@ class OrchestratorRuntime:
             model_routes=model_routes,
             prefetch_info=prefetch_info,
             effective_agents=effective_agent_payload,
+            iteration_count=iteration_count,
+            stop_reason=stop_reason,
+            orchestration_steps=[dict(item) for item in member_outputs],
         )
 
     def _apply_external_prefetch_strategy(
